@@ -22,7 +22,7 @@ start from shared ground.
 @rule(name="thumbnail", version=3, on={"created", "modified"},
       match="**/*.{jpg,png,gif}", output="{dir}/thumbs/thumb_{name}")
 def thumbnail(event, ctx):
-    ...
+    make_thumbnail(event.path, ctx.output)  # see "Handler contract" below
 ```
 
 - **`output` is a pattern, never code.** It must be invertible. That is what makes
@@ -31,6 +31,41 @@ def thumbnail(event, ctx):
   must be idempotent. To get "A then B," chain through directories: stage N's
   output is stage N+1's match. The DAG is computed from the rules, never written.
 - **Cycles:** a static check at registration, plus runtime provenance and a depth cap.
+
+## Handler contract
+
+`handler(event, ctx) -> None`. Parts of this are known; the rest is proposed.
+
+**`event`**: what happened, as recorded in the journal. *Known:*
+
+| field | meaning |
+|---|---|
+| `kind` | `created`, `modified`, `deleted`, or `moved` |
+| `path` | the file the event is about |
+| `source` | `inotify` or `scan`, or `handler:<name>` when another handler's output caused it |
+| `id`, `ts` | journal id and timestamp |
+
+Handler-caused events also carry a chain depth, which enforces the runtime cycle
+cap. *Open:* whether `path` is absolute, root-relative, or both (named roots in the
+output grammar suggest both), and how `moved` carries its old and new paths.
+
+**`ctx`**: *not yet defined.* Proposed contents, each one implied by the design:
+
+- `ctx.output`: the output path computed from the rule's `output` pattern. Handlers
+  write there instead of computing their own path, so the pattern stays the single
+  source of truth for cycles, staleness, and self-ignore.
+- An atomic-write helper (temp file, then rename), because handlers must not leave
+  partial files where other rules can see them.
+- The rule's `name` and `version`.
+- Read access to catalog facts (size, mtime, hash, mimetype), so handlers don't
+  recompute them.
+- Later, not in the MVP: enough information for a handler to decide its own cache hits.
+
+**Return value**: *not yet decided.* Proposed: `None`. Returning normally means
+success. Raising means failure: the engine retries with backoff, then parks the job
+in a dead-letter queue. The engine already knows the declared output from the
+pattern, so returning the written paths would only duplicate it and let the two
+disagree.
 
 ## Decided
 
