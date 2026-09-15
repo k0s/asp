@@ -18,15 +18,31 @@ start from shared ground.
 
 ## Rules
 
+A rule is a decorator that configures a generic function. The decorator says
+*where* the output goes and *with what parameters*; the function only turns an
+input into an output.
+
 ```python
-@rule(name="thumbnail", version=3, on={"created", "modified"},
-      match="**/*.{jpg,png,gif}", output="{dir}/thumbs/thumb_{name}")
-def thumbnail(event, ctx):
-    make_thumbnail(event.path, ctx.output)  # see "Handler contract" below
+@rule(name="thumb-128", version=1, on={"created", "modified"},
+      match="**/*.{jpg,png,gif}", output="{dir}/thumbs/128/{name}",
+      params={"size": 128})
+@rule(name="thumb-1024", version=1, on={"created", "modified"},
+      match="**/*.{jpg,png,gif}", output="{dir}/thumbs/1024/{name}",
+      params={"size": 1024})
+def thumbnail(event, out, size):
+    save(resize(open_image(event.path), size), out)
 ```
 
-- **`output` is a pattern, never code.** It must be invertible. That is what makes
-  cycle detection, staleness checks, self-ignore, and orphan detection possible.
+- **Zero or one output per rule.** `output` is one invertible path pattern, or
+  `None` for rules with side effects only (purge, notify). Multiple outputs come
+  from stacking rules on one function, and each rule is its own job with its own
+  retries. Invertibility is what makes cycle detection, staleness checks,
+  self-ignore, and orphan detection possible. It also means derived files can be
+  told apart from authored ones without the database.
+- **`output` is a pattern, never code.** The function never knows its output path
+  or how many siblings it has.
+- **Parameters go in `params`**, not loose decorator keywords, so a handler argument
+  named `version` or `match` can't collide with the decorator's own.
 - **Handlers are unordered and independent.** Delivery is at-least-once, so handlers
   must be idempotent. To get "A then B," chain through directories: stage N's
   output is stage N+1's match. The DAG is computed from the rules, never written.
@@ -34,9 +50,11 @@ def thumbnail(event, ctx):
 
 ## Handler contract
 
-`handler(event, ctx) -> None`. Parts of this are known; the rest is proposed.
+```python
+def handler(event, out, **params) -> None
+```
 
-**`event`**: what happened, as recorded in the journal. *Known:*
+**`event`** describes what happened, as recorded in the journal:
 
 | field | meaning |
 |---|---|
@@ -46,26 +64,24 @@ def thumbnail(event, ctx):
 | `id`, `ts` | journal id and timestamp |
 
 Handler-caused events also carry a chain depth, which enforces the runtime cycle
-cap. *Open:* whether `path` is absolute, root-relative, or both (named roots in the
-output grammar suggest both), and how `moved` carries its old and new paths.
+cap. Facts about the file (size, mtime, hash, mimetype) belong on the event too.
+*Open:* whether `path` is absolute, root-relative, or both, and how `moved`
+carries its old and new paths.
 
-**`ctx`**: *not yet defined.* Proposed contents, each one implied by the design:
+**`out`** is a temporary path the engine chose, or `None` when the rule declares
+no output. The handler writes there. After it returns, the engine atomically
+renames the file to the path the pattern computes. The engine owns the write: it
+names temp files so it can ignore their events, and it publishes only what the
+declared output allows.
 
-- `ctx.output`: the output path computed from the rule's `output` pattern. Handlers
-  write there instead of computing their own path, so the pattern stays the single
-  source of truth for cycles, staleness, and self-ignore.
-- An atomic-write helper (temp file, then rename), because handlers must not leave
-  partial files where other rules can see them.
-- The rule's `name` and `version`.
-- Read access to catalog facts (size, mtime, hash, mimetype), so handlers don't
-  recompute them.
-- Later, not in the MVP: enough information for a handler to decide its own cache hits.
+**Return value:** `None`. Returning normally means success. Raising means failure:
+the engine retries with backoff, then parks the job in a dead-letter queue. If a
+handler leaves `out` unwritten, that is recorded as "nothing to do this time,"
+not treated as an error.
 
-**Return value**: *not yet decided.* Proposed: `None`. Returning normally means
-success. Raising means failure: the engine retries with backoff, then parks the job
-in a dead-letter queue. The engine already knows the declared output from the
-pattern, so returning the written paths would only duplicate it and let the two
-disagree.
+Staleness comes from the **job record**: rule R at version V ran on this input
+and produced this output, or nothing. A file-age check alone would re-run
+no-output rules on every scan.
 
 ## Decided
 
@@ -104,6 +120,12 @@ It asserts the output appears with the expected contents, and that non-matching
 files (`*.md`) produce nothing.
 
 ## Open
+
+- **TODO: a multi-output form of the decorator**, for handlers where the outputs
+  share expensive work (transcode once, emit several renditions). Stacked rules
+  repeat that work. One candidate keeps every static check: a rule declares a
+  per-input *directory* (`{dir}/renditions/{name}/`) and the handler fills it
+  freely, choosing how many files and what they're named.
 
 - Symlink semantics: the link index, projecting events onto aliases, and
   containment
