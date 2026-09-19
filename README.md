@@ -29,8 +29,19 @@ input into an output.
 @rule(name="thumb-1024", version=1, on={"created", "modified"},
       match="**/*.{jpg,png,gif}", output="{dir}/thumbs/1024/{name}",
       params={"size": 1024})
-def thumbnail(event, out, size):
+def thumbnail(event: Event, out: Path, size: int) -> Path:
     save(resize(open_image(event.path), size), out)
+    return out          # the engine renames it to the declared path
+```
+
+A rule with side effects and no output returns `None`:
+
+```python
+@rule(name="purge", version=1, on={"created", "modified"},
+      match="site/**/*", output=None)
+def purge(event: Event, out: None) -> None:
+    cdn.purge(event.path)
+    return None
 ```
 
 - **Zero or one output per rule.** `output` is one invertible path pattern, or
@@ -51,37 +62,53 @@ def thumbnail(event, out, size):
 ## Handler contract
 
 ```python
-def handler(event, out, **params) -> None
+EventKind = Literal["created", "modified", "deleted", "moved"]
+
+@dataclass(frozen=True)
+class Event:
+    id: int                  # journal id
+    ts: datetime
+    kind: EventKind
+    path: Path               # the file the event is about
+    source: str              # "inotify" | "scan" | "handler:<name>"
+    depth: int               # chain depth; 0 unless a handler caused it
+    size: int | None         # catalog facts, present when known
+    mtime: float | None
+    sha256: str | None
+    mimetype: str | None
+
+Handler = Callable[..., Path | None]
+
+def handler(event: Event, out: Path | None, **params: Any) -> Path | None: ...
+
+def rule(*, name: str, version: int, on: set[EventKind], match: str,
+         output: str | None = None,
+         params: dict[str, Any] | None = None) -> Callable[[Handler], Handler]: ...
 ```
 
-**`event`** describes what happened, as recorded in the journal:
+**`out`** is a temporary path the engine chose, or `None` when the rule declares no
+output. The engine owns the write: it names temp files so it can ignore their events,
+and it publishes only to the declared path.
 
-| field | meaning |
+**The return value says what the handler did**: `out` if it wrote, `None` if it
+didn't. That's a statement of intent rather than something the engine has to infer
+from the filesystem, where "chose to write nothing" and "failed to write" look alike.
+
+| handler returns | the engine |
 |---|---|
-| `kind` | `created`, `modified`, `deleted`, or `moved` |
-| `path` | the file the event is about |
-| `source` | `inotify` or `scan`, or `handler:<name>` when another handler's output caused it |
-| `id`, `ts` | journal id and timestamp |
+| `out` | checks the file exists, then atomically renames it to the declared path |
+| `None` | records "nothing to do"; a leftover temp file means a bug and is reported |
+| any other path | fails the job — the handler wrote somewhere it wasn't given |
+| *raises* | retries with backoff, then parks the job in the dead-letter queue |
 
-Handler-caused events also carry a chain depth, which enforces the runtime cycle
-cap. Facts about the file (size, mtime, hash, mimetype) belong on the event too.
-*Open:* whether `path` is absolute, root-relative, or both, and how `moved`
+For a rule with `output=None`, `out` is `None` and the handler must return `None`.
+
+Staleness comes from the **job record**: rule R at version V ran on this input and
+produced this output, or nothing. A file-age check alone would re-run no-output rules
+on every scan.
+
+*Open:* whether `event.path` is absolute, root-relative, or both, and how `moved`
 carries its old and new paths.
-
-**`out`** is a temporary path the engine chose, or `None` when the rule declares
-no output. The handler writes there. After it returns, the engine atomically
-renames the file to the path the pattern computes. The engine owns the write: it
-names temp files so it can ignore their events, and it publishes only what the
-declared output allows.
-
-**Return value:** `None`. Returning normally means success. Raising means failure:
-the engine retries with backoff, then parks the job in a dead-letter queue. If a
-handler leaves `out` unwritten, that is recorded as "nothing to do this time,"
-not treated as an error.
-
-Staleness comes from the **job record**: rule R at version V ran on this input
-and produced this output, or nothing. A file-age check alone would re-run
-no-output rules on every scan.
 
 ## Decided
 
