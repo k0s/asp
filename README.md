@@ -13,7 +13,7 @@ start from shared ground.
 | **engine** | `asp` itself: daemon, journal, reconciler, monitor, CLI, web UI |
 | **monitor** | the watchdog/inotify component that feeds filesystem events in |
 | **watcher** | an external package of rules, loaded by explicit config declaration |
-| **rule** | declarative match + output pattern + version, wrapping a handler |
+| **rule** | declarative match + output pattern, wrapping a handler |
 | **handler** | the rule's body: arbitrary, idempotent Python |
 
 ## Rules
@@ -23,10 +23,10 @@ A rule is a decorator that configures a generic function. The decorator says
 input into an output.
 
 ```python
-@rule(name="thumb-128", version=1, on={"created", "modified"},
+@rule(name="thumb-128", on={"created", "modified"},
       match="**/*.{jpg,png,gif}", output="{dir}/thumbs/128/{name}",
       params={"size": 128})
-@rule(name="thumb-1024", version=1, on={"created", "modified"},
+@rule(name="thumb-1024", on={"created", "modified"},
       match="**/*.{jpg,png,gif}", output="{dir}/thumbs/1024/{name}",
       params={"size": 1024})
 def thumbnail(event: Event, out: Path | None, size: int) -> Path | None:
@@ -36,15 +36,27 @@ def thumbnail(event: Event, out: Path | None, size: int) -> Path | None:
     return out                      # the engine renames it to the declared path
 ```
 
-Every handler shares one signature and may always return `None`, so the annotation
-is `Path | None` even here. The engine resolves the union per rule: a rule with an
-`output` pattern always passes a `Path`, and a rule with `output=None` always passes
-`None`.
+### What a handler receives, and what it returns
+
+| parameter | type | meaning |
+|---|---|---|
+| `event` | `Event` | what happened: kind, path, source, journal id and timestamp, plus file facts when they are known. Full shape under [Handler contract](#handler-contract). |
+| `out` | `Path \| None` | a temp path the engine chose for this rule's declared output, or `None` when the rule declares `output=None`. The handler writes there and never computes a destination itself. |
+| `**params` | whatever the rule declared | the decorator's `params` dict, passed through unchanged (`size=128` above). These are the function's own arguments; the engine does not interpret them. |
+
+**Returns `Path | None`** — the `out` it wrote, or `None` for "nothing to do." The
+engine checks the answer against what is on disk, then renames a written file
+atomically to the path the pattern computes.
+
+Every handler shares this one signature and may always return `None`, so the
+annotation is `Path | None` even for `thumbnail`. The engine resolves the union per
+rule: a rule with an `output` pattern always passes a `Path`, and a rule with
+`output=None` always passes `None`.
 
 A rule with side effects and no output returns `None`:
 
 ```python
-@rule(name="purge", version=1, on={"created", "modified"},
+@rule(name="purge", on={"created", "modified"},
       match="site/**/*", output=None)
 def purge(event: Event, out: Path | None) -> Path | None:
     cdn.purge(event.path)
@@ -60,7 +72,7 @@ def purge(event: Event, out: Path | None) -> Path | None:
 - **`output` is a pattern, never code.** The function never knows its output path
   or how many siblings it has.
 - **Parameters go in `params`**, not loose decorator keywords, so a handler argument
-  named `version` or `match` can't collide with the decorator's own.
+  named `match` or `output` can't collide with the decorator's own.
 - **Handlers are unordered and independent.** Delivery is at-least-once, so handlers
   must be idempotent. To get "A then B," chain through directories: stage N's
   output is stage N+1's match. The DAG is computed from the rules, never written.
@@ -88,7 +100,7 @@ Handler = Callable[..., Path | None]
 
 def handler(event: Event, out: Path | None, **params: Any) -> Path | None: ...
 
-def rule(*, name: str, version: int, on: set[EventKind], match: str,
+def rule(*, name: str, on: set[EventKind], match: str,
          output: str | None = None,
          params: dict[str, Any] | None = None) -> Callable[[Handler], Handler]: ...
 ```
@@ -110,9 +122,8 @@ from the filesystem, where "chose to write nothing" and "failed to write" look a
 
 For a rule with `output=None`, `out` is `None` and the handler must return `None`.
 
-Staleness comes from the **job record**: rule R at version V ran on this input and
-produced this output, or nothing. A file-age check alone would re-run no-output rules
-on every scan.
+Staleness comes from the **job record**: rule R ran on this input and produced this
+output, or nothing. A file-age check alone would re-run no-output rules on every scan.
 
 *Open:* whether `event.path` is absolute, root-relative, or both, and how `moved`
 carries its old and new paths.
@@ -155,6 +166,12 @@ files (`*.md`) produce nothing.
 
 ## Open
 
+- **Invalidating derived outputs when the generator changes.** If a handler's logic
+  changes, existing outputs are wrong, and nothing on disk says so: the inputs didn't
+  change, so mtime comparisons see nothing. **Deliberately not decided.** A declared
+  generator version on the rule is one option; caching against the handler's own code,
+  or an explicit cache-invalidation command, are others. Not in the current plan —
+  settle the design before writing the code that assumes it.
 - **TODO: a multi-output form of the decorator**, for handlers where the outputs
   share expensive work (transcode once, emit several renditions). Stacked rules
   repeat that work. One candidate keeps every static check: a rule declares a
