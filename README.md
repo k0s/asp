@@ -29,19 +29,26 @@ input into an output.
 @rule(name="thumb-1024", version=1, on={"created", "modified"},
       match="**/*.{jpg,png,gif}", output="{dir}/thumbs/1024/{name}",
       params={"size": 1024})
-def thumbnail(event: Event, out: Path, size: int) -> Path:
+def thumbnail(event: Event, out: Path | None, size: int) -> Path | None:
+    if out is None or not is_image(event.path):
+        return None                 # nothing to do; the engine records that
     save(resize(open_image(event.path), size), out)
-    return out          # the engine renames it to the declared path
+    return out                      # the engine renames it to the declared path
 ```
+
+Every handler shares one signature and may always return `None`, so the annotation
+is `Path | None` even here. The engine resolves the union per rule: a rule with an
+`output` pattern always passes a `Path`, and a rule with `output=None` always passes
+`None`.
 
 A rule with side effects and no output returns `None`:
 
 ```python
 @rule(name="purge", version=1, on={"created", "modified"},
       match="site/**/*", output=None)
-def purge(event: Event, out: None) -> None:
+def purge(event: Event, out: Path | None) -> Path | None:
     cdn.purge(event.path)
-    return None
+    return None                     # nothing written, ever
 ```
 
 - **Zero or one output per rule.** `output` is one invertible path pattern, or
