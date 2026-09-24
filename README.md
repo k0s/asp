@@ -3,8 +3,12 @@
 **asp** (asset pipeline) is a filesystem data pipeline. It watches directories,
 records every change in a durable journal, and runs rules that react to it.
 
-Status: **pre-code.** This README records the agreed design so the first tests
-start from shared ground.
+Status: **pre-code.** This README records the agreed design, and the first test
+(expected to fail until the engine exists) pins down the entry point.
+
+asp is meant to run equally well **as a container**: an input volume, an output
+volume, and a config. The in-process test runs the same arrangement, with temp
+directories standing in for the mounts.
 
 ## Nouns
 
@@ -29,36 +33,68 @@ input into an output.
 @rule(name="thumb-1024", on={"created", "modified"},
       match="**/*.{jpg,png,gif}", output="{dir}/thumbs/1024/{name}",
       params={"size": 1024})
-def thumbnail(event: Event, out: Path | None, size: int) -> Path | None:
+def thumbnail(event: Event, out: BinaryIO | None, size: int) -> BinaryIO | None:
     if out is None or not is_image(event.path):
         return None                 # nothing to do; the engine records that
-    save(resize(open_image(event.path), size), out)
-    return out                      # the engine renames it to the declared path
+    save(resize(open_image(event.path), size), out, format=image_format(event.path))
+    return out                      # the engine publishes it to the declared path
 ```
+
+### Roots and patterns
+
+A **root** is a named directory that asp manages. Rules refer to roots by name,
+and `asp.json` binds each name to a path, so a watcher never contains a
+host-specific path:
+
+```json
+{"roots": {"in": "/home/me/site", "out": "/home/me/derived"},
+ "watchers": ["snakewatchers.thumbs"]}
+```
+
+Patterns may carry a **root prefix**, `<root>:<pattern>`:
+
+```python
+match="in:**/*.txt"          # any .txt anywhere under the "in" root
+output="out:{dir}/{name}"    # the same relative spot under the "out" root
+```
+
+The rest of the pattern is relative to that root: `{dir}` is the input's
+directory relative to its root, and `{name}` is its filename. So
+`in:sub/b.txt` becomes `out:sub/b.txt`. With no prefix, a `match` applies in
+every root, and an `output` lands in the input's own root, which is why the
+thumbnail rule above writes next to its image. Text before the first `:` is a
+root only if it names a declared root; referencing an undeclared one is a
+load-time error.
 
 ### What a handler receives, and what it returns
 
 | parameter | type | meaning |
 |---|---|---|
 | `event` | `Event` | what happened: kind, path, source, journal id and timestamp, plus file facts when they are known. Full shape under [Handler contract](#handler-contract). |
-| `out` | `Path \| None` | a temp path the engine chose for this rule's declared output, or `None` when the rule declares `output=None`. The handler writes there and never computes a destination itself. |
+| `out` | `BinaryIO \| None` | a temp file the engine opened (binary, writable) for this rule's declared output, or `None` when the rule declares `output=None`. The handler writes to it and never computes a destination itself. `out.name` is its path, for tools that need one. |
 | `**params` | whatever the rule declared | the decorator's `params` dict, passed through unchanged (`size=128` above). These are the function's own arguments; the engine does not interpret them. |
 
-**Returns `Path | None`** — the `out` it wrote, or `None` for "nothing to do." The
-engine checks the answer against what is on disk, then renames a written file
-atomically to the path the pattern computes.
+**Returns `BinaryIO | None`** — `out` to publish what it wrote, or `None` for
+"nothing to do." The engine then atomically renames the temp file to the path the
+pattern computes, or deletes it. The file exists either way, so the return value
+is what tells "wrote an empty file" apart from "wrote nothing."
 
 Every handler shares this one signature and may always return `None`, so the
-annotation is `Path | None` even for `thumbnail`. The engine resolves the union per
-rule: a rule with an `output` pattern always passes a `Path`, and a rule with
+annotation is `BinaryIO | None` even for `thumbnail`. The engine resolves the union
+per rule: a rule with an `output` pattern always passes a file, and a rule with
 `output=None` always passes `None`.
+
+`out` is binary. A text handler encodes (`out.write(s.encode())`) rather than
+wrapping `out` in `io.TextIOWrapper`, which would close the engine's file when
+it is garbage-collected. A `mode=` keyword, spelled like `open()`'s, is reserved
+for later: text output, and editing an existing output copy-on-write.
 
 A rule with side effects and no output returns `None`:
 
 ```python
 @rule(name="purge", on={"created", "modified"},
-      match="site/**/*", output=None)
-def purge(event: Event, out: Path | None) -> Path | None:
+      match="site:**/*", output=None)
+def purge(event: Event, out: BinaryIO | None) -> BinaryIO | None:
     cdn.purge(event.path)
     return None                     # nothing written, ever
 ```
@@ -88,7 +124,9 @@ class Event:
     id: int                  # journal id
     ts: datetime
     kind: EventKind
-    path: Path               # the file the event is about
+    root: str                # the root it is under, by name
+    rel: PurePosixPath       # its path relative to that root: the identity
+    path: Path               # its absolute path on this host, for reading
     source: str              # "inotify" | "scan" | "handler:<name>"
     depth: int               # chain depth; 0 unless a handler caused it
     size: int | None         # catalog facts, present when known
@@ -96,18 +134,21 @@ class Event:
     sha256: str | None
     mimetype: str | None
 
-Handler = Callable[..., Path | None]
+Handler = Callable[..., BinaryIO | None]
 
-def handler(event: Event, out: Path | None, **params: Any) -> Path | None: ...
+def handler(event: Event, out: BinaryIO | None, **params: Any) -> BinaryIO | None: ...
 
 def rule(*, name: str, on: set[EventKind], match: str,
          output: str | None = None,
          params: dict[str, Any] | None = None) -> Callable[[Handler], Handler]: ...
 ```
 
-**`out`** is a temporary path the engine chose, or `None` when the rule declares no
-output. The engine owns the write: it names temp files so it can ignore their events,
-and it publishes only to the declared path.
+**`out`** is a temporary file the engine opened in the destination's directory, or
+`None` when the rule declares no output. The engine owns the write: it names temp
+files so it can ignore their events, keeps them on the destination's filesystem so
+publishing is one atomic rename, and publishes only to the declared path. It
+publishes by path, not through the handle, so a tool that replaces the file at
+`out.name` works too.
 
 **The return value says what the handler did**: `out` if it wrote, `None` if it
 didn't. That's a statement of intent rather than something the engine has to infer
@@ -115,9 +156,9 @@ from the filesystem, where "chose to write nothing" and "failed to write" look a
 
 | handler returns | the engine |
 |---|---|
-| `out` | checks the file exists, then atomically renames it to the declared path |
-| `None` | records "nothing to do"; a leftover temp file means a bug and is reported |
-| any other path | fails the job — the handler wrote somewhere it wasn't given |
+| `out` | closes it, then atomically renames it to the declared path |
+| `None` | records "nothing to do" and deletes the temp file |
+| anything else | fails the job — a contract violation |
 | *raises* | retries with backoff, then parks the job in the dead-letter queue |
 
 For a rule with `output=None`, `out` is `None` and the handler must return `None`.
@@ -125,8 +166,10 @@ For a rule with `output=None`, `out` is `None` and the handler must return `None
 Staleness comes from the **job record**: rule R ran on this input and produced this
 output, or nothing. A file-age check alone would re-run no-output rules on every scan.
 
-*Open:* whether `event.path` is absolute, root-relative, or both, and how `moved`
-carries its old and new paths.
+The journal records `root` and `rel`, never the absolute path, because absolute
+paths differ between a host and a container over the same volumes.
+
+*Open:* how `moved` carries its old and new paths.
 
 ## Decided
 
@@ -146,6 +189,9 @@ carries its old and new paths.
   no entry-point discovery and no hot reload. The first is `snakewatchers`.
 - **Single writer:** handlers run only on the always-on host. Everywhere else the
   engine only observes.
+- **The container is a first-class way to run asp**: mount inputs and outputs,
+  supply `asp.json`, and use it that way. Nothing in the engine may assume a bare
+  host.
 - **The monitor never follows symlinks.** Verified against watchdog 6.0.0: it skips
   linked directories and passes `IN_DONT_FOLLOW`, even for a root. Using symlinks
   as pipeline plumbing therefore needs a link index in asp (not yet designed).
@@ -159,10 +205,22 @@ watched live in Grafana and paged through in the UI.
 
 ## Development
 
-Test-first. The first test runs an in-process engine against temp `in/` and `out/`
-directories, with a rule on `*.txt` whose handler uppercases seeded random text.
-It asserts the output appears with the expected contents, and that non-matching
-files (`*.md`) produce nothing.
+Test-first, with `uv`:
+
+```sh
+uv sync --group dev
+uv run pytest
+```
+
+The first test ([`tests/test_run_once.py`](tests/test_run_once.py)) builds an
+in-process engine from an `asp.json` binding temp `in/` and `out/` roots, with one
+fixture watcher whose rule uppercases `in:**/*.txt` into `out:{dir}/{name}`. After
+a single `run_once()` reconciliation pass, `out/` must hold exactly the uppercased
+`.txt` files (so `*.md` produced nothing and no temp file leaked), and `in/` must
+be unchanged. A pass is synchronous, so the negative case needs no idle signal.
+
+Tests written ahead of the code are marked `xfail`; `xfail_strict` makes an
+unexpected pass fail the run, so each marker comes off as soon as the code lands.
 
 ## Open
 
@@ -177,9 +235,18 @@ files (`*.md`) produce nothing.
   repeat that work. One candidate keeps every static check: a rule declares a
   per-input *directory* (`{dir}/renditions/{name}/`) and the handler fills it
   freely, choosing how many files and what they're named.
+- **Modifying the input in place.** Renaming or rewriting an authored file (for
+  example, date-stamping a new post) fits only as an `output=None` rule today: the
+  engine can't verify it, and the change raises a new event on the input, so only
+  the rule's own match keeps it from looping.
+- **Many-to-one outputs.** An index page, a feed, or a gallery depends on a *set*
+  of inputs. Nothing in the rule model expresses that yet; a blogging engine will
+  need it.
 
 - Symlink semantics: the link index, projecting events onto aliases, and
   containment
-- Output-pattern grammar: named roots, so `in/` → `out/` can be expressed
-- An observable idle state, which negative tests need as a sync point
-- Journal retention, batch matching, per-rule settle windows
+- An observable idle state, so a test against the live daemon can assert that
+  nothing happened without sleeping
+- Where the journal lives (in a container, likely a third volume), and how
+  relative paths in `asp.json` resolve
+- Journal retention, per-rule settle windows
