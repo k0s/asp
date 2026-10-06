@@ -193,7 +193,8 @@ paths differ between a host and a container over the same volumes.
   supply `asp.json`, and use it that way. Nothing in the engine may assume a bare
   host.
 - **Relative root paths resolve against the config file's directory**, or against
-  `$ASP_ROOT` when that is set. Absolute paths are used as given.
+  `$ASP_ROOT` when that is set. A leading `~` is expanded first, and absolute paths
+  always win.
 - **The monitor never follows symlinks.** Verified against watchdog 6.0.0: it skips
   linked directories and passes `IN_DONT_FOLLOW`, even for a root. Using symlinks
   as pipeline plumbing therefore needs a link index in asp (not yet designed).
