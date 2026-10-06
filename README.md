@@ -192,6 +192,8 @@ paths differ between a host and a container over the same volumes.
 - **The container is a first-class way to run asp**: mount inputs and outputs,
   supply `asp.json`, and use it that way. Nothing in the engine may assume a bare
   host.
+- **Relative root paths resolve against the config file's directory**, or against
+  `$ASP_ROOT` when that is set. Absolute paths are used as given.
 - **The monitor never follows symlinks.** Verified against watchdog 6.0.0: it skips
   linked directories and passes `IN_DONT_FOLLOW`, even for a root. Using symlinks
   as pipeline plumbing therefore needs a link index in asp (not yet designed).
@@ -247,6 +249,5 @@ unexpected pass fail the run, so each marker comes off as soon as the code lands
   containment
 - An observable idle state, so a test against the live daemon can assert that
   nothing happened without sleeping
-- Where the journal lives (in a container, likely a third volume), and how
-  relative paths in `asp.json` resolve
+- Where the journal lives (in a container, likely a third volume)
 - Journal retention, per-rule settle windows
