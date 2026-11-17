@@ -3,8 +3,52 @@
 **asp** (asset pipeline) is a filesystem data pipeline. It watches directories,
 records every change in a durable journal, and runs rules that react to it.
 
-Status: **first engine.** `Engine.from_config(path).run_once()` runs one
-reconciliation pass. There is no journal, daemon, or monitor yet.
+Status: **reconciler, journal, CLI and dashboard.** asp scans its roots,
+journals what changed, runs the rules that apply, and shows all of it on a
+localhost dashboard. There is no inotify monitor yet, so changes are noticed by
+scanning: once per `asp run`, or every few seconds under `asp serve --interval`.
+
+## Using it
+
+```sh
+uv tool install "asp[web] @ git+https://github.com/k0s/asp"
+```
+
+```json
+{"roots": {"site": "/home/me/site"},
+ "db": "/home/me/.local/state/asp/asp.db",
+ "watchers": ["snakewatchers.thumbs"]}
+```
+
+| command | does |
+|---|---|
+| `asp run` | one reconciliation pass; exits 1 if a job failed |
+| `asp serve --interval 5` | the dashboard on `127.0.0.1:8765`, and a pass every 5 seconds |
+| `asp status` | roots, rules, and what the journal holds |
+| `asp events`, `asp jobs` | the most recent of each; `--help` lists the filters |
+| `asp retry JOB` | requeue a failed or parked job |
+| `asp rules` | the loaded rules |
+
+Each takes `--config PATH`, and otherwise reads `$ASP_CONFIG` or `./asp.json`.
+
+The dashboard shows events per hour, every event and job, each file's history
+and what was derived from it, the loaded rules, and a retry button on jobs that
+failed. `/metrics` serves the same counts in Prometheus text format. It has no
+authentication: keep it on localhost.
+
+[`sandbox/`](sandbox/README.md) sets up a throwaway tree with sample pictures
+and the dashboard running, with one `ansible-playbook` command.
+
+### `asp.json`
+
+| key | |
+|---|---|
+| `roots` | name → directory. Required; each must exist. |
+| `watchers` | module names to import rules from. Required; may be empty. |
+| `db` | the journal's path. Without it asp keeps no history: every pass treats every file as new. |
+| `ignore` | globs, matched against root-relative paths of directories and files. Replaces the default, which skips `.stfolder`, `.stversions`, `.git`, `.hg` and Syncthing's temp files. |
+
+Relative paths, `db` included, resolve as described under [Decided](#decided).
 
 asp is meant to run equally well **as a container**: an input volume, an output
 volume, and a config. The in-process test runs the same arrangement, with temp
@@ -112,7 +156,17 @@ def purge(event: Event, out: BinaryIO | None) -> BinaryIO | None:
 - **Handlers are unordered and independent.** Delivery is at-least-once, so handlers
   must be idempotent. To get "A then B," chain through directories: stage N's
   output is stage N+1's match. The DAG is computed from the rules, never written.
-- **Cycles:** a static check at registration, plus runtime provenance and a depth cap.
+- **A handler never runs on its own outputs.** A file that matches the output
+  pattern of any rule on the same handler is skipped by all of that handler's
+  rules, so a thumbnail is never thumbnailed, even when stacked rules write
+  several sizes into the tree they read. The check reads the pattern backwards
+  (`{dir}/thumbs/{name}` matches `**/thumbs/*`) and needs no database. The cost
+  is that an authored file at such a path is skipped too.
+- **Cycles across handlers** are stopped by a depth cap: the journal records
+  which job published each file, a derived file's events carry
+  `source="handler:<rule>"` and a depth one more than its input's, and at depth
+  8 jobs are parked instead of run. A static check at registration is still to
+  come.
 
 ## Handler contract
 
@@ -159,9 +213,15 @@ from the filesystem, where "chose to write nothing" and "failed to write" look a
 | `out` | closes it, then atomically renames it to the declared path |
 | `None` | records "nothing to do" and deletes the temp file |
 | anything else | fails the job — a contract violation |
-| *raises* | retries with backoff, then parks the job in the dead-letter queue |
+| *raises* | records the failure and retries on the next pass; after 3 attempts the job is parked until someone retries it |
 
 For a rule with `output=None`, `out` is `None` and the handler must return `None`.
+
+Without a journal there is nowhere to record a failure, so a handler that raises
+aborts the pass.
+
+Job states: `queued`, `done`, `skipped` (the handler returned `None`), `failed`
+(will be retried) and `parked`.
 
 Staleness comes from the **job record**: rule R ran on this input and produced this
 output, or nothing. A file-age check alone would re-run no-output rules on every scan.
@@ -184,7 +244,8 @@ paths differ between a host and a container over the same volumes.
 - **Config is JSON only** (`asp.json`). No TOML anywhere, except `pyproject.toml`,
   which Python packaging requires.
 - **Metrics come from a Prometheus exporter** at `/metrics`, scraped rather than
-  pushed, so the TSDB stays a swappable view.
+  pushed, so the TSDB stays a swappable view. The text format is written by hand:
+  a few gauges don't need a client library.
 - **Watchers live outside this repo** and load from an explicit import list, with
   no entry-point discovery and no hot reload. The first is `snakewatchers`.
 - **Single writer:** handlers run only on the always-on host. Everywhere else the
@@ -202,7 +263,8 @@ paths differ between a host and a container over the same volumes.
 ## M1: the observatory
 
 Daemon (monitor, journal, reconciler), CLI, localhost web UI, `/metrics`, and
-Grafana dashboards, with **zero real handlers**. It is useful on its own, because
+Grafana dashboards, with **zero real handlers**. Still to come: the inotify
+monitor, settle windows, and the Grafana dashboards. It is useful on its own, because
 it shows what actually changes in synced trees. Done when a sync storm can be
 watched live in Grafana and paged through in the UI.
 
@@ -221,6 +283,9 @@ fixture watcher whose rule uppercases `in:**/*.txt` into `out:{dir}/{name}`. Aft
 a single `run_once()` reconciliation pass, `out/` must hold exactly the uppercased
 `.txt` files (so `*.md` produced nothing and no temp file leaked), and `in/` must
 be unchanged. A pass is synchronous, so the negative case needs no idle signal.
+
+`tests/test_journal.py` covers reconciliation against a journal, and
+`tests/test_web.py` the dashboard and CLI.
 
 Tests written ahead of the code are marked `xfail`; `xfail_strict` makes an
 unexpected pass fail the run, so each marker comes off as soon as the code lands.
@@ -250,5 +315,9 @@ unexpected pass fail the run, so each marker comes off as soon as the code lands
   containment
 - An observable idle state, so a test against the live daemon can assert that
   nothing happened without sleeping
-- Where the journal lives (in a container, likely a third volume)
+- Where the journal lives in a container (likely a third volume); on a host it is
+  wherever `db` says
 - Journal retention, per-rule settle windows
+- What a rule on `deleted` receives, and whether outputs whose input is gone
+  should be reported as orphans. Today the event is journaled and nothing is removed.
+- Changes are detected by size and mtime; the `sha256` column is not filled in yet.

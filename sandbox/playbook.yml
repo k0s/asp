@@ -1,0 +1,174 @@
+---
+# A sandbox for asp: a throwaway tree of sample pictures, a journal, the
+# thumbnail watcher, and the dashboard kept running as a user service.
+#
+#   ansible-playbook sandbox/playbook.yml
+#   ansible-playbook sandbox/playbook.yml -e sandbox_state=absent   # stop it
+#
+# Nothing here needs root, and nothing outside sandbox_dir is touched except
+# the user's own systemd unit. asp is installed editable from this checkout,
+# so the sandbox runs whatever is checked out; restart the service to pick up
+# a change. Running the playbook again changes nothing.
+- name: asp sandbox
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    sandbox_dir: "{{ ansible_facts.user_dir }}/asp-sandbox"
+    sandbox_state: present              # or absent
+    sandbox_service: true               # false: install only, run asp by hand
+    sandbox_port: 8765
+    sandbox_interval: 5                 # seconds between reconciliation passes
+    sandbox_unit: asp-sandbox
+    asp_source: "{{ playbook_dir | dirname }}"
+    # Anything pip accepts: a checkout path, or a git URL.
+    snakewatchers_source: "git+https://github.com/k0s/snakewatchers"
+    sandbox_unit_dir: "{{ ansible_facts.user_dir }}/.config/systemd/user"
+    sandbox_config:
+      roots:
+        site: site
+      db: state/asp.db
+      watchers:
+        - snakewatchers.thumbs
+
+  tasks:
+    - name: Remove the sandbox service
+      when: sandbox_state == "absent"
+      block:
+        - name: Check for the unit
+          ansible.builtin.stat:
+            path: "{{ sandbox_unit_dir }}/{{ sandbox_unit }}.service"
+          register: sandbox_unit_file
+
+        - name: Stop and disable the dashboard
+          ansible.builtin.systemd_service:
+            name: "{{ sandbox_unit }}"
+            scope: user
+            state: stopped
+            enabled: false
+          when: sandbox_unit_file.stat.exists
+
+        - name: Remove the unit
+          ansible.builtin.file:
+            path: "{{ sandbox_unit_dir }}/{{ sandbox_unit }}.service"
+            state: absent
+          register: sandbox_unit_removed
+
+        - name: Reload systemd
+          ansible.builtin.systemd_service:
+            scope: user
+            daemon_reload: true
+          when: sandbox_unit_removed is changed
+
+        - name: Say what is left
+          ansible.builtin.debug:
+            msg: "The service is gone. {{ sandbox_dir }} is left alone; delete it by hand."
+
+    - name: Build the sandbox
+      when: sandbox_state == "present"
+      block:
+        - name: Create the sandbox directories
+          ansible.builtin.file:
+            path: "{{ sandbox_dir }}/{{ item }}"
+            state: directory
+            mode: "0755"
+          loop: ["", site, state]
+
+        - name: Create the virtualenv
+          ansible.builtin.command:
+            cmd: uv venv --python 3.13 .venv
+            chdir: "{{ sandbox_dir }}"
+            creates: "{{ sandbox_dir }}/.venv/bin/python"
+
+        - name: Install asp from this checkout, and the watchers
+          ansible.builtin.command:
+            argv:
+              - uv
+              - pip
+              - install
+              - --python
+              - "{{ sandbox_dir }}/.venv/bin/python"
+              - --editable
+              - "{{ asp_source }}[web]"
+              - "snakewatchers @ {{ snakewatchers_source }}"
+          register: sandbox_install
+          changed_when: "'Installed' in sandbox_install.stderr"
+          notify: Restart the dashboard
+
+        - name: Write asp.json
+          ansible.builtin.copy:
+            content: "{{ sandbox_config | to_nice_json }}\n"
+            dest: "{{ sandbox_dir }}/asp.json"
+            mode: "0644"
+          notify: Restart the dashboard
+
+        - name: Put sample pictures in the site root
+          ansible.builtin.command:
+            argv:
+              - "{{ sandbox_dir }}/.venv/bin/python"
+              - "{{ playbook_dir }}/make_samples.py"
+              - "{{ sandbox_dir }}/site"
+          register: sandbox_samples
+          changed_when: "not sandbox_samples.stdout.startswith('0 sample files')"
+
+        - name: Run the dashboard as a user service
+          when: sandbox_service | bool
+          block:
+            - name: Create the user unit directory
+              ansible.builtin.file:
+                path: "{{ sandbox_unit_dir }}"
+                state: directory
+                mode: "0755"
+
+            - name: Install the unit
+              ansible.builtin.copy:
+                dest: "{{ sandbox_unit_dir }}/{{ sandbox_unit }}.service"
+                mode: "0644"
+                content: |
+                  [Unit]
+                  Description=asp sandbox: dashboard and reconciler on 127.0.0.1:{{ sandbox_port }}
+
+                  [Service]
+                  WorkingDirectory={{ sandbox_dir }}
+                  ExecStart={{ sandbox_dir }}/.venv/bin/asp serve --config {{ sandbox_dir }}/asp.json --host 127.0.0.1 --port {{ sandbox_port }} --interval {{ sandbox_interval }}
+                  Restart=on-failure
+
+                  [Install]
+                  WantedBy=default.target
+              notify: Restart the dashboard
+
+            - name: Enable and start the dashboard
+              ansible.builtin.systemd_service:
+                name: "{{ sandbox_unit }}"
+                scope: user
+                daemon_reload: true
+                enabled: true
+                state: started
+
+        - name: Apply pending restarts before checking
+          ansible.builtin.meta: flush_handlers
+
+        - name: Wait for the dashboard
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ sandbox_port }}/api/summary"
+          register: sandbox_up
+          until: sandbox_up.status == 200
+          retries: 20
+          delay: 1
+          when: sandbox_service | bool
+
+        - name: Say where it is
+          ansible.builtin.debug:
+            msg: >-
+              Sandbox in {{ sandbox_dir }}.
+              {{ 'Dashboard: http://127.0.0.1:%s/' % sandbox_port if sandbox_service | bool
+                 else 'Run it: cd %s && .venv/bin/asp serve --interval 5' % sandbox_dir }}
+
+  handlers:
+    - name: Restart the dashboard
+      ansible.builtin.systemd_service:
+        name: "{{ sandbox_unit }}"
+        scope: user
+        daemon_reload: true
+        state: restarted
+      when: sandbox_service | bool
