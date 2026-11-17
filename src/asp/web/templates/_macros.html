@@ -1,0 +1,36 @@
+{% macro path(root, rel) %}<a class="path" href="/file?{{ query(root=root, rel=rel) }}"><span class="root">{{ root }}:</span>{{ rel }}</a>{% endmacro %}
+
+{% macro kind(k) %}<span class="tag"><span class="dot {{ k }}"></span>{{ k }}</span>{% endmacro %}
+
+{% macro job_state(s) %}<span class="tag"><span class="dot {{ s }}"></span>{{ s }}</span>{% endmacro %}
+
+{% macro events_table(events) %}
+{% if events %}
+<table>
+<thead><tr><th>When</th><th>Kind</th><th>Path</th><th class="num">Size</th><th>Source</th></tr></thead>
+<tbody>
+{% for e in events %}
+<tr><td class="when">{{ e.ts|when }}</td><td>{{ kind(e.kind) }}</td>
+<td>{{ path(e.root, e.rel) }}</td><td class="num dim">{{ e.size|bytes }}</td>
+<td>{% if e.source != "scan" %}<span class="pill" title="depth {{ e.depth }}">{{ e.source }}</span>{% else %}<span class="dim">scan</span>{% endif %}</td></tr>
+{% endfor %}
+</tbody></table>
+{% else %}<div class="empty">No events yet. Run a pass.</div>{% endif %}
+{% endmacro %}
+
+{% macro jobs_table(jobs, thumbs=true) %}
+{% if jobs %}
+<table>
+<thead><tr><th>When</th><th>State</th><th>Rule</th><th>Input</th><th>Output</th><th class="num">Took</th><th></th></tr></thead>
+<tbody>
+{% for j in jobs %}
+<tr><td class="when">{{ (j.finished or j.ts)|when }}</td><td>{{ job_state(j.state) }}</td>
+<td><a href="/jobs?{{ query(rule=j.rule) }}">{{ j.rule }}</a></td>
+<td>{{ path(j.root, j.rel) }}</td>
+<td>{% if j.output_rel %}{% if thumbs and j.output_rel is image %}<a href="/file?{{ query(root=j.output_root, rel=j.output_rel) }}"><img class="thumb" loading="lazy" onerror="this.remove()" alt="{{ j.output_rel }}" title="{{ j.output_root }}:{{ j.output_rel }}" src="/raw?{{ query(root=j.output_root, rel=j.output_rel) }}"></a>{% else %}{{ path(j.output_root, j.output_rel) }}{% endif %}{% elif j.error %}<span class="error">{{ j.error }}</span>{% endif %}</td>
+<td class="num dim">{{ j.duration|duration }}</td>
+<td>{% if j.state in ("failed", "parked") %}<form method="post" action="/jobs/{{ j.id }}/retry"><button class="small">Retry</button></form>{% endif %}</td></tr>
+{% endfor %}
+</tbody></table>
+{% else %}<div class="empty">No jobs.</div>{% endif %}
+{% endmacro %}

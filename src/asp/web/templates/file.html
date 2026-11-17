@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}{{ rel }} · asp{% endblock %}
+{% block main %}
+<h1 class="path"><span class="root">{{ root }}:</span>{{ rel }}</h1>
+<div class="cols">
+  <div class="card"><div class="head"><h2>Now</h2></div><div class="body">
+    {% if entry %}
+    <dl>
+      <dt>Size</dt><dd>{{ entry.size|bytes }}</dd>
+      <dt>First seen</dt><dd>{{ entry.first_seen|when }}</dd>
+      <dt>Last changed</dt><dd>{{ entry.last_seen|when }}</dd>
+      <dt>Kind</dt><dd>{% if entry.derived_by %}derived by <a href="/jobs?{{ query(rule=entry.derived_by) }}">{{ entry.derived_by }}</a>, {{ entry.depth }} step{{ "s" if entry.depth != 1 }} from an authored file{% else %}authored{% endif %}</dd>
+      {% if made_by %}<dt>Made from</dt><dd>{{ m.path(made_by[0].root, made_by[0].rel) }}</dd>{% endif %}
+    </dl>
+    {% else %}<div class="empty">Not on disk as of the last pass.</div>{% endif %}
+  </div></div>
+  <div class="card"><div class="head"><h2>Preview</h2></div><div class="body">
+    {% if entry and rel is image %}<a href="/raw?{{ query(root=root, rel=rel) }}"><img class="preview" alt="{{ rel }}" src="/raw?{{ query(root=root, rel=rel) }}"></a>
+    {% else %}<div class="empty">No preview.</div>{% endif %}
+  </div></div>
+</div>
+{% set outputs = jobs|selectattr("output_rel")|list %}
+{% if outputs %}
+<div class="card"><div class="head"><h2>Derived from this file</h2></div><div class="body">
+  {% set shown = [] %}
+  <div class="gallery">
+  {% for j in outputs if (j.output_root, j.output_rel) not in shown %}{% set _ = shown.append((j.output_root, j.output_rel)) %}
+    {% if j.output_rel is image %}<a href="/file?{{ query(root=j.output_root, rel=j.output_rel) }}" title="{{ j.rule }}: {{ j.output_root }}:{{ j.output_rel }}"><img loading="lazy" alt="{{ j.output_rel }}" src="/raw?{{ query(root=j.output_root, rel=j.output_rel) }}"></a>
+    {% else %}<div>{{ m.path(j.output_root, j.output_rel) }}</div>{% endif %}
+  {% endfor %}
+  </div>
+</div></div>
+{% endif %}
+<div class="card"><div class="head"><h2>Jobs run on this file</h2></div>{{ m.jobs_table(jobs, thumbs=false) }}</div>
+<div class="card"><div class="head"><h2>History</h2></div>{{ m.events_table(events) }}</div>
+{% endblock %}

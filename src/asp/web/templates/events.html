@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Events · asp{% endblock %}
+{% block main %}
+<h1>Events</h1>
+<form class="filters">
+  <select name="kind" onchange="this.form.submit()"><option value="">any kind</option>{% for k in kinds %}<option {% if k == kind %}selected{% endif %}>{{ k }}</option>{% endfor %}</select>
+  <select name="root" onchange="this.form.submit()"><option value="">any root</option>{% for r in config.roots %}<option {% if r == root %}selected{% endif %}>{{ r }}</option>{% endfor %}</select>
+  <input type="search" name="q" value="{{ q }}" placeholder="path contains…">
+  <button>Filter</button>
+</form>
+<div class="card">{{ m.events_table(events) }}
+{% if older %}<div class="more"><a href="/events?{{ query(kind=kind, root=root, q=q, before=older) }}">Older events</a></div>{% endif %}</div>
+{% endblock %}

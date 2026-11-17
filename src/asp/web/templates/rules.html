@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Rules · asp{% endblock %}
+{% block main %}
+<h1>Rules</h1>
+<div class="card">
+{% if rules %}
+<table><thead><tr><th>Rule</th><th>On</th><th>Match</th><th>Output</th><th>Params</th><th>Handler</th><th class="num">Done</th><th class="num">Skipped</th><th class="num">Failed</th></tr></thead><tbody>
+{% for b in rules %}{% set c = counts.get(b.rule.name, {}) %}
+<tr><td><a href="/jobs?{{ query(rule=b.rule.name) }}"><strong>{{ b.rule.name }}</strong></a></td>
+<td class="dim">{{ b.rule.on|sort|join(", ") }}</td>
+<td class="path">{{ b.rule.match }}</td>
+<td class="path">{{ b.rule.output or "—" }}</td>
+<td class="path dim">{% for k, v in b.rule.params.items() %}{{ k }}={{ v }}{{ ", " if not loop.last }}{% endfor %}</td>
+<td class="path dim">{{ b.rule.handler.__module__ }}.{{ b.rule.handler.__name__ }}</td>
+<td class="num">{{ c.get("done", 0) }}</td><td class="num">{{ c.get("skipped", 0) }}</td>
+<td class="num">{{ c.get("failed", 0) + c.get("parked", 0) }}</td></tr>
+{% endfor %}
+</tbody></table>
+{% else %}<div class="empty">No rules are loaded. Name watcher modules in <code>asp.json</code>.</div>{% endif %}
+</div>
+<div class="card"><div class="head"><h2>Watchers</h2></div><div class="body">
+  {% if config.watchers %}{% for w in config.watchers %}<div class="path">{{ w }}</div>{% endfor %}{% else %}<span class="dim">none</span>{% endif %}
+</div></div>
+{% endblock %}

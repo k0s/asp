@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Jobs · asp{% endblock %}
+{% block main %}
+<h1>Jobs</h1>
+<form class="filters">
+  <select name="state" onchange="this.form.submit()"><option value="">any state</option>{% for s in job_states %}<option {% if s == state_ %}selected{% endif %}>{{ s }}</option>{% endfor %}</select>
+  <select name="rule" onchange="this.form.submit()"><option value="">any rule</option>{% for b in rules %}<option {% if b.rule.name == rule %}selected{% endif %}>{{ b.rule.name }}</option>{% endfor %}</select>
+</form>
+<div class="card">{{ m.jobs_table(jobs) }}
+{% if older %}<div class="more"><a href="/jobs?{{ query(state=state_, rule=rule, before=older) }}">Older jobs</a></div>{% endif %}</div>
+{% endblock %}

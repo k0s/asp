@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block main %}
+{% set jobs_n = summary.jobs %}
+<div class="tiles">
+  <div class="tile"><h2>Files</h2>
+    <div class="value">{{ "{:,}".format(summary.roots|sum(attribute="files")) }}</div>
+    <div class="note">{{ summary.roots|sum(attribute="derived") }} derived · {{ summary.roots|sum(attribute="bytes")|bytes }}</div></div>
+  <div class="tile"><h2>Events, 24 h</h2>
+    <div class="value">{{ "{:,}".format(summary.events_24h.values()|sum) }}</div>
+    <div class="note">{{ "{:,}".format(summary.events_total) }} all time</div></div>
+  <div class="tile"><h2>Jobs done</h2>
+    <div class="value">{{ "{:,}".format(jobs_n.get("done", 0)) }}</div>
+    <div class="note">{{ jobs_n.get("skipped", 0) }} skipped · {{ jobs_n.get("queued", 0) }} queued</div></div>
+  <div class="tile"><h2>Needs attention</h2>
+    <div class="value">{{ attention }}</div>
+    <div class="note">{% if attention %}<a href="/jobs?state=parked">{{ jobs_n.get("parked", 0) }} parked</a> · <a href="/jobs?state=failed">{{ jobs_n.get("failed", 0) }} retrying</a>{% else %}nothing failed or parked{% endif %}</div></div>
+  <div class="tile"><h2>Last pass</h2>
+    {% set last = (summary.last_pass.finished|when).split(" ") if summary.last_pass else ["", "never"] %}
+    <div class="value">{{ last[1] }}</div>
+    <div class="note">{{ last[0] }} · {% if state.interval %}every {{ state.interval|round|int }} s{% else %}on demand{% endif %}</div></div>
+</div>
+
+<div class="card">
+  <div class="head"><h2>Events per hour, last 48 hours</h2>
+    <div class="legend">{% for k in kinds %}<span class="tag"><span class="dot {{ k }}"></span>{{ k }}</span>{% endfor %}</div></div>
+  <div class="body">
+  {% if chart.total %}
+  <svg viewBox="0 0 {{ chart.width }} {{ chart.height }}" width="100%" role="img" aria-label="Events per hour by kind over the last 48 hours">
+    {% for t in chart.ticks %}
+    <line class="grid" x1="{{ chart.left }}" x2="{{ chart.right }}" y1="{{ t.y }}" y2="{{ t.y }}"/>
+    <text x="{{ chart.left - 6 }}" y="{{ t.y + 4 }}" text-anchor="end">{{ "{:,}".format(t.value) }}</text>
+    {% endfor %}
+    {% for c in chart.columns %}
+      {% for s in c.segments %}<rect class="seg {{ s.kind }}" x="{{ s.x|round(1) }}" y="{{ s.y|round(1) }}" width="{{ s.w|round(1) }}" height="{{ s.h|round(1) }}" rx="{{ 3 if loop.last else 0 }}"/>{% endfor %}
+      {% if c.tick %}<text x="{{ c.cx|round(1) }}" y="{{ chart.height - 6 }}" text-anchor="middle">{{ c.day or c.tick }}</text>{% endif %}
+      <rect class="hit" x="{{ c.x|round(1) }}" y="{{ chart.top }}" width="{{ c.w|round(1) }}" height="{{ chart.plot_h }}" data-label="{{ c.label }}" {% for k in kinds %}data-{{ k }}="{{ c.counts[k] }}" {% endfor %}/>
+    {% endfor %}
+  </svg>
+  <details><summary>Show as a table</summary>
+    <table><thead><tr><th>Hour</th>{% for k in kinds %}<th class="num">{{ k }}</th>{% endfor %}</tr></thead><tbody>
+    {% for c in chart.columns if c.counts.values()|sum %}<tr><td>{{ c.label }}</td>{% for k in kinds %}<td class="num">{{ c.counts[k] }}</td>{% endfor %}</tr>{% endfor %}
+    </tbody></table></details>
+  {% else %}<div class="empty">Nothing has changed in the last 48 hours.</div>{% endif %}
+  </div>
+</div>
+
+<div class="cols">
+  <div class="card"><div class="head"><h2>Roots</h2></div>
+    <table><thead><tr><th>Root</th><th>Path</th><th class="num">Files</th><th class="num">Derived</th><th class="num">Size</th></tr></thead><tbody>
+    {% set by_root = {} %}{% for r in summary.roots %}{% set _ = by_root.update({r.root: r}) %}{% endfor %}
+    {% for name, where in config.roots.items() %}{% set r = by_root.get(name) %}
+    <tr><td><a href="/files?{{ query(root=name) }}">{{ name }}</a></td><td class="path dim">{{ where }}</td>
+    <td class="num">{{ r.files if r else 0 }}</td><td class="num">{{ r.derived if r else 0 }}</td><td class="num dim">{{ (r.bytes if r else 0)|bytes }}</td></tr>
+    {% endfor %}</tbody></table></div>
+  <div class="card"><div class="head"><h2>Recent passes</h2></div>
+    {% if passes %}<table><thead><tr><th>Finished</th><th class="num">Files</th><th class="num">Events</th><th class="num">Jobs</th></tr></thead><tbody>
+    {% for p in passes %}<tr><td class="when">{{ (p.finished or p.started)|when }}</td><td class="num">{{ p.files }}</td><td class="num">{{ p.events }}</td><td class="num">{{ p.jobs }}</td></tr>{% endfor %}
+    </tbody></table>{% else %}<div class="empty">No passes yet.</div>{% endif %}</div>
+</div>
+
+<div class="card"><div class="head"><h2>Latest jobs</h2><a href="/jobs">all jobs</a></div>
+  {{ m.jobs_table(jobs) }}</div>
+<div class="card"><div class="head"><h2>Latest events</h2><a href="/events">all events</a></div>
+  {{ m.events_table(events) }}</div>
+{% endblock %}
+{% block script %}
+<script>
+const tip = document.getElementById("tip");
+for (const hit of document.querySelectorAll(".hit")) {
+  hit.addEventListener("mousemove", (e) => {
+    const d = hit.dataset;
+    tip.innerHTML = `<b>${d.label}</b>` + ["created", "modified", "deleted"].map((k) =>
+      `<div><span class="tag"><span class="dot ${k}"></span>${k}</span><span>${d[k]}</span></div>`).join("");
+    tip.style.display = "block";
+    const x = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8);
+    tip.style.left = x + "px"; tip.style.top = (e.clientY + 14) + "px";
+  });
+  hit.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+}
+</script>
+{% endblock %}
