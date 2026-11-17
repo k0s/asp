@@ -33,6 +33,7 @@ Variables, with `-e name=value`:
 | `sandbox_interval` | `5` | seconds between passes |
 | `sandbox_service` | `true` | `false` installs without a service |
 | `snakewatchers_source` | the GitHub repo | a checkout path works too |
+| `sandbox_reinstall` | `false` | `true` reinstalls asp, after its dependencies change |
 | `sandbox_state` | `present` | `absent` stops and removes the service |
 
 `sandbox_state=absent` leaves `~/asp-sandbox` in place; delete it by hand.
