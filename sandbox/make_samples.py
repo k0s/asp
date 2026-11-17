@@ -7,6 +7,7 @@ Pillow, which the sandbox has through snakewatchers.
 """
 
 import colorsys
+import json
 import math
 import random
 import sys
@@ -24,16 +25,23 @@ GALLERIES = {
 }
 # The galleries ask for thumbnails in their metadata; the top level does not,
 # so welcome.png shows what a declined job looks like.
-ASKS = '{{"version": 1, "title": "{title}", "k0sngin": {{"images": {{"thumbnails": true, "width": {width}}}}}}}\n'
+def asks(title: str, width: int) -> str:
+    """An index.json asking for thumbnails, indented by two spaces as
+    index.json files are."""
+    data = {"version": 1, "title": title,
+            "k0sngin": {"images": {"thumbnails": True, "width": width}}}
+    return json.dumps(data, indent=2) + "\n"
+
+
 NOTES = {
     "README.txt": "Drop a picture into landscapes/, portraits/ or patterns/.\n"
                   "asp puts a thumbnail beside it, in thumbs/, because each of those\n"
                   "directories asks for thumbnails in its index.json.\n"
                   "A picture dropped here, at the top, gets none: nothing asks.\n",
     "landscapes/notes.txt": "Text files are journaled too, but no rule matches them.\n",
-    "landscapes/index.json": ASKS.format(title="Landscapes", width=300),
-    "portraits/index.json": ASKS.format(title="Portraits", width=150),
-    "patterns/index.json": ASKS.format(title="Patterns", width=200),
+    "landscapes/index.json": asks("Landscapes", 300),
+    "portraits/index.json": asks("Portraits", 150),
+    "patterns/index.json": asks("Patterns", 200),
 }
 
 
