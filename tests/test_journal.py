@@ -106,6 +106,7 @@ def test_a_failing_job_is_retried_then_parked_and_can_be_requeued(tree) -> None:
     assert (job["state"], job["attempts"], job["error"]) == (
         "parked", 3, "RuntimeError: not today: in:a.txt")
     assert files_under(tree / "out") == set()
+    assert list((tree / "out").iterdir()) == []      # not even directories
 
     flaky.FAIL = False
     assert e.journal.retry(job["id"])

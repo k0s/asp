@@ -87,3 +87,24 @@ def test_scan_skips_temp_files_and_symlinks(tmp_path, roots) -> None:
 def test_load_errors(tmp_path, roots, watchers, message) -> None:
     with pytest.raises(ConfigError, match=message):
         engine(tmp_path, *watchers)
+
+
+def dirs_under(root: Path) -> set[str]:
+    return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_dir()}
+
+
+def test_a_declining_handler_leaves_no_directories(tmp_path, roots) -> None:
+    engine(tmp_path, "watchers.decline").run_once()
+    assert dirs_under(roots[1]) == set()
+
+
+def test_a_raising_handler_leaves_no_directories(tmp_path, roots) -> None:
+    with pytest.raises(RuntimeError):
+        engine(tmp_path, "watchers.boom").run_once()
+    assert dirs_under(roots[1]) == set()
+
+
+def test_publishing_makes_the_directories_it_needs(tmp_path, roots) -> None:
+    engine(tmp_path, "watchers.sibling", roots={"in": "in"}).run_once()
+    assert {"copies", "sub/copies"} <= dirs_under(roots[0])
+    assert not list(roots[0].rglob(".asp-*"))
