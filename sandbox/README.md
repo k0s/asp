@@ -8,9 +8,13 @@ dashboard, watching the tree for changes.
 ansible-playbook sandbox/playbook.yml
 ```
 
-Then open <http://127.0.0.1:8765/> and drop a picture into `~/asp-sandbox/site`.
-About a second later it has a `thumbs/thumb_<name>` beside it, and the event and
-the job are on the page.
+Then open <http://127.0.0.1:8765/> and drop a picture into
+`~/asp-sandbox/site/landscapes`. About a second later it has a
+`thumbs/thumb_<name>` beside it, and the event and the job are on the page.
+
+The three galleries ask for thumbnails in their `index.json`
+(`"k0sngin": {"images": {"thumbnails": true}}`), each at a different width. The
+top level asks for nothing, so a picture dropped there shows as a `skipped` job.
 
 | | |
 |---|---|
