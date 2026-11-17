@@ -50,6 +50,48 @@ and what was derived from it, the loaded rules, and a retry button on jobs that
 failed. `/metrics` serves the same counts in Prometheus text format. It has no
 authentication: keep it on localhost.
 
+### As a container
+
+The image holds the engine; watchers are added when it is built:
+
+```sh
+docker build -t asp \
+  --build-arg WATCHERS="snakewatchers@git+https://github.com/k0s/snakewatchers" .
+```
+
+Mount each root, the config, and a directory for the journal, and run as the
+user who owns the mounted files:
+
+```sh
+docker run -d --name asp --user "$(id -u):$(id -g)" \
+  -v ~/site:/data/site \
+  -v ~/asp/asp.json:/config/asp.json:ro \
+  -v ~/asp/state:/state \
+  -p 127.0.0.1:8765:8765 asp
+```
+
+```json
+{"roots": {"site": "/data/site"}, "db": "/state/asp.db",
+ "watchers": ["snakewatchers.thumbs"]}
+```
+
+The default command is `serve --host 0.0.0.0 --watch --interval 900`: the
+dashboard, a pass on every change, and one every 15 minutes. Any `asp` command
+works in its place (`docker run … asp run --dry-run`).
+
+- **`--user` matters.** Without it the container runs as root, and every
+  thumbnail it writes into your directories belongs to root.
+- **The monitor works through bind mounts**: inotify reports writes made on the
+  host. It does not on network or FUSE filesystems; use `--interval` alone there.
+- **The journal is portable.** It stores paths by root name, so a journal made by
+  asp on the host works in the container and back, given the same root names.
+  Don't run both at once.
+- Symlinks in a root are not followed in a container any more than on the host.
+  A directory reached by a symlink needs its own mount and root.
+
+[`tests/container/run.sh`](tests/container/run.sh) builds the image and checks
+all of this; CI runs it.
+
 [`sandbox/`](sandbox/README.md) sets up a throwaway tree with sample pictures
 and the dashboard running, with one `ansible-playbook` command.
 
@@ -336,8 +378,6 @@ unexpected pass fail the run, so each marker comes off as soon as the code lands
 
 - Symlink semantics: the link index, projecting events onto aliases, and
   containment
-- Where the journal lives in a container (likely a third volume); on a host it is
-  wherever `db` says
 - Journal retention, per-rule settle windows (there is one global `--settle`)
 - What a rule on `deleted` receives, and whether outputs whose input is gone
   should be reported as orphans. Today the event is journaled and nothing is removed.
