@@ -22,10 +22,18 @@ GALLERIES = {
     "patterns": [("rings.png", (800, 800)), ("weave.webp", (1000, 1000)),
                  ("dots.gif", (480, 360)), ("tiny.png", (120, 90))],
 }
+# The galleries ask for thumbnails in their metadata; the top level does not,
+# so welcome.png shows what a declined job looks like.
+ASKS = '{{"version": 1, "title": "{title}", "k0sngin": {{"images": {{"thumbnails": true, "width": {width}}}}}}}\n'
 NOTES = {
-    "README.txt": "Drop pictures anywhere under this directory.\n"
-                  "asp puts a thumbnail beside each one, in thumbs/.\n",
+    "README.txt": "Drop a picture into landscapes/, portraits/ or patterns/.\n"
+                  "asp puts a thumbnail beside it, in thumbs/, because each of those\n"
+                  "directories asks for thumbnails in its index.json.\n"
+                  "A picture dropped here, at the top, gets none: nothing asks.\n",
     "landscapes/notes.txt": "Text files are journaled too, but no rule matches them.\n",
+    "landscapes/index.json": ASKS.format(title="Landscapes", width=300),
+    "portraits/index.json": ASKS.format(title="Portraits", width=150),
+    "patterns/index.json": ASKS.format(title="Patterns", width=200),
 }
 
 
