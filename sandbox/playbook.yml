@@ -20,9 +20,11 @@
     sandbox_port: 8765
     sandbox_interval: 5                 # seconds between reconciliation passes
     sandbox_unit: asp-sandbox
+    sandbox_reinstall: false            # true: reinstall asp, for new dependencies
     asp_source: "{{ playbook_dir | dirname }}"
     # Anything pip accepts: a checkout path, or a git URL.
     snakewatchers_source: "git+https://github.com/k0s/snakewatchers"
+    snakewatchers_requires: [pillow]
     sandbox_unit_dir: "{{ ansible_facts.user_dir }}/.config/systemd/user"
     sandbox_config:
       roots:
@@ -80,7 +82,19 @@
             chdir: "{{ sandbox_dir }}"
             creates: "{{ sandbox_dir }}/.venv/bin/python"
 
-        - name: Install asp from this checkout, and the watchers
+        - name: See which asp the sandbox has
+          ansible.builtin.command:
+            argv: [uv, pip, show, --python, "{{ sandbox_dir }}/.venv/bin/python", asp]
+          register: sandbox_has
+          changed_when: false
+          failed_when: false
+
+        # uv rebuilds an editable install every time it is asked, so only ask
+        # when the sandbox doesn't already point at this checkout.
+        - name: Install asp from this checkout
+          when: >-
+            sandbox_reinstall | bool or
+            ('Editable project location: ' + asp_source | realpath) not in sandbox_has.stdout
           ansible.builtin.command:
             argv:
               - uv
@@ -90,9 +104,24 @@
               - "{{ sandbox_dir }}/.venv/bin/python"
               - --editable
               - "{{ asp_source }}[web]"
-              - "snakewatchers @ {{ snakewatchers_source }}"
-          register: sandbox_install
-          changed_when: "'Installed' in sandbox_install.stderr"
+          register: sandbox_asp
+          changed_when: "'Installed' in sandbox_asp.stderr"
+          notify: Restart the dashboard
+
+        # snakewatchers asks for asp from GitHub, which would replace the
+        # checkout installed above; so its other requirements are named here.
+        - name: Install the watchers
+          ansible.builtin.command:
+            argv: "{{ ['uv', 'pip', 'install', '--python', sandbox_dir + '/.venv/bin/python', '--no-deps', 'snakewatchers @ ' + snakewatchers_source] }}"
+          register: sandbox_watchers
+          changed_when: "'Installed' in sandbox_watchers.stderr"
+          notify: Restart the dashboard
+
+        - name: Install what the watchers need
+          ansible.builtin.command:
+            argv: "{{ ['uv', 'pip', 'install', '--python', sandbox_dir + '/.venv/bin/python'] + snakewatchers_requires }}"
+          register: sandbox_requires
+          changed_when: "'Installed' in sandbox_requires.stderr"
           notify: Restart the dashboard
 
         - name: Write asp.json
