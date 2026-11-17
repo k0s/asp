@@ -9,8 +9,6 @@ import random
 import string
 from pathlib import Path
 
-import pytest
-
 SEED = 20260924
 
 
@@ -27,7 +25,6 @@ def files_under(root: Path) -> set[str]:
     return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
 
 
-@pytest.mark.xfail(reason="the engine does not exist yet")
 def test_run_once_publishes_matching_files(tmp_path: Path) -> None:
     from asp import Engine
 
