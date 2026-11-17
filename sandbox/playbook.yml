@@ -18,7 +18,7 @@
     sandbox_state: present              # or absent
     sandbox_service: true               # false: install only, run asp by hand
     sandbox_port: 8765
-    sandbox_interval: 5                 # seconds between reconciliation passes
+    sandbox_interval: 300               # seconds between passes the monitor didn't ask for
     sandbox_unit: asp-sandbox
     sandbox_reinstall: false            # true: reinstall asp, for new dependencies
     asp_source: "{{ playbook_dir | dirname }}"
@@ -103,7 +103,7 @@
               - --python
               - "{{ sandbox_dir }}/.venv/bin/python"
               - --editable
-              - "{{ asp_source }}[web]"
+              - "{{ asp_source }}[web,monitor]"
           register: sandbox_asp
           changed_when: "'Installed' in sandbox_asp.stderr"
           notify: Restart the dashboard
@@ -155,11 +155,11 @@
                 mode: "0644"
                 content: |
                   [Unit]
-                  Description=asp sandbox: dashboard and reconciler on 127.0.0.1:{{ sandbox_port }}
+                  Description=asp sandbox: dashboard, monitor and reconciler on 127.0.0.1:{{ sandbox_port }}
 
                   [Service]
                   WorkingDirectory={{ sandbox_dir }}
-                  ExecStart={{ sandbox_dir }}/.venv/bin/asp serve --config {{ sandbox_dir }}/asp.json --host 127.0.0.1 --port {{ sandbox_port }} --interval {{ sandbox_interval }}
+                  ExecStart={{ sandbox_dir }}/.venv/bin/asp serve --config {{ sandbox_dir }}/asp.json --host 127.0.0.1 --port {{ sandbox_port }} --watch --interval {{ sandbox_interval }}
                   Restart=on-failure
 
                   [Install]
@@ -191,7 +191,7 @@
             msg: >-
               Sandbox in {{ sandbox_dir }}.
               {{ 'Dashboard: http://127.0.0.1:%s/' % sandbox_port if sandbox_service | bool
-                 else 'Run it: cd %s && .venv/bin/asp serve --interval 5' % sandbox_dir }}
+                 else 'Run it: cd %s && .venv/bin/asp serve --watch' % sandbox_dir }}
 
   handlers:
     - name: Restart the dashboard

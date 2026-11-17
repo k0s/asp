@@ -8,7 +8,7 @@ from typing import Annotated
 import typer
 
 from .config import ConfigError
-from .engine import Engine, Pass
+from .engine import Engine, Pass, Plan
 from .journal import JOB_STATES, Journal, JournalError
 
 app = typer.Typer(no_args_is_help=True, add_completion=False,
@@ -19,9 +19,9 @@ Config = Annotated[Path, typer.Option(
 DEFAULT_CONFIG = Path("asp.json")
 
 
-def load(config: Path) -> Engine:
+def load(config: Path, create_journal: bool = True) -> Engine:
     try:
-        return Engine.from_config(config)
+        return Engine.from_config(config, create_journal=create_journal)
     except (ConfigError, JournalError) as exc:
         typer.echo(f"asp: {exc}", err=True)
         raise typer.Exit(2) from exc
@@ -41,12 +41,33 @@ def describe(done: Pass) -> str:
 
 
 @app.command()
-def run(config: Config = DEFAULT_CONFIG) -> None:
+def run(config: Config = DEFAULT_CONFIG,
+        dry_run: Annotated[bool, typer.Option(
+            "--dry-run", "-n", help="Say what a pass would do; write nothing.")] = False,
+        ) -> None:
     """Run one reconciliation pass and say what it did."""
+    if dry_run:
+        show_plan(load(config, create_journal=False).plan())
+        return
     done = load(config).run_once()
     typer.echo(describe(done))
     if done.jobs.get("failed") or done.jobs.get("parked"):
         raise typer.Exit(1)
+
+
+def show_plan(plan: Plan) -> None:
+    for job in plan.jobs:
+        target = f" -> {job.output[0]}:{job.output[1]}" if job.output else ""
+        notes = [n for n in ("OVERWRITES" if job.overwrites else "",
+                             job.why if job.why != "new" else "") if n]
+        typer.echo(f"{job.rule}  {job.root}:{job.rel}{target}"
+                   f"{'  [' + ', '.join(notes) + ']' if notes else ''}")
+    events = ", ".join(f"{n} {kind}" for kind, n in sorted(plan.events.items())) or "none"
+    writes = [job for job in plan.jobs if job.output]
+    over = sum(job.overwrites for job in writes)
+    typer.echo(f"dry run: {plan.files} files; events: {events}; {len(plan.jobs)} jobs "
+               f"would run, writing {len(writes) - over} new files and "
+               f"overwriting {over}. Nothing was written.")
 
 
 @app.command()
@@ -117,14 +138,50 @@ def rules(config: Config = DEFAULT_CONFIG) -> None:
                    f"{'  ' + str(b.rule.params) if b.rule.params else ''}")
 
 
+Interval = Annotated[float | None, typer.Option(
+    help="Run a pass every this many seconds.")]
+Watch = Annotated[bool, typer.Option(
+    "--watch", help="Run a pass whenever something under a root changes.")]
+Settle = Annotated[float, typer.Option(
+    help="With --watch: seconds of quiet to wait for after a change.")]
+
+
+def need_watchdog(watch: bool) -> None:
+    if not watch:
+        return
+    try:
+        import watchdog  # noqa: F401
+    except ImportError as exc:
+        typer.echo("asp: --watch needs the 'monitor' extra (watchdog)", err=True)
+        raise typer.Exit(2) from exc
+
+
+@app.command()
+def watch(config: Config = DEFAULT_CONFIG, interval: Interval = 300.0,
+          settle: Settle = 1.0) -> None:
+    """Keep the roots reconciled, without the dashboard: a pass after every
+    change, and one every --interval seconds for anything the monitor missed."""
+    engine = load(config)
+    need_watchdog(True)
+    from .monitor import Reconciler
+
+    reconciler = Reconciler(engine, interval=interval, watch=True, settle=settle)
+    reconciler.start()
+    try:
+        while reconciler.is_alive():
+            reconciler.join(1)
+    except KeyboardInterrupt:
+        reconciler.stop()
+
+
 @app.command()
 def serve(config: Config = DEFAULT_CONFIG,
           host: str = "127.0.0.1", port: int = 8765,
-          interval: Annotated[float | None, typer.Option(
-              help="Also run a pass every this many seconds.")] = None) -> None:
+          interval: Interval = None, watch: Watch = False, settle: Settle = 1.0) -> None:
     """Serve the dashboard, and optionally keep reconciling."""
     engine = load(config)
     journal_of(engine)
+    need_watchdog(watch)
     try:
         import uvicorn
 
@@ -132,7 +189,8 @@ def serve(config: Config = DEFAULT_CONFIG,
     except ImportError as exc:
         typer.echo(f"asp: the dashboard needs the 'web' extra: {exc}", err=True)
         raise typer.Exit(2) from exc
-    uvicorn.run(create_app(engine, interval=interval), host=host, port=port,
+    uvicorn.run(create_app(engine, interval=interval, watch=watch, settle=settle),
+                host=host, port=port,
                 log_level=os.environ.get("ASP_LOG_LEVEL", "warning"))
 
 

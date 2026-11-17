@@ -3,15 +3,14 @@
 **asp** (asset pipeline) is a filesystem data pipeline. It watches directories,
 records every change in a durable journal, and runs rules that react to it.
 
-Status: **reconciler, journal, CLI and dashboard.** asp scans its roots,
-journals what changed, runs the rules that apply, and shows all of it on a
-localhost dashboard. There is no inotify monitor yet, so changes are noticed by
-scanning: once per `asp run`, or every few seconds under `asp serve --interval`.
+Status: **monitor, reconciler, journal, CLI and dashboard.** asp watches its
+roots, journals what changed, runs the rules that apply, and shows all of it on
+a localhost dashboard.
 
 ## Using it
 
 ```sh
-uv tool install "asp[web] @ git+https://github.com/k0s/asp"
+uv tool install "asp[web,monitor] @ git+https://github.com/k0s/asp"
 ```
 
 ```json
@@ -23,13 +22,28 @@ uv tool install "asp[web] @ git+https://github.com/k0s/asp"
 | command | does |
 |---|---|
 | `asp run` | one reconciliation pass; exits 1 if a job failed |
-| `asp serve --interval 5` | the dashboard on `127.0.0.1:8765`, and a pass every 5 seconds |
+| `asp run --dry-run` | what that pass would do, marking outputs that would overwrite a file; writes nothing |
+| `asp serve --watch` | the dashboard on `127.0.0.1:8765`, and a pass whenever something changes |
+| `asp watch` | the same reconciling, without the dashboard |
 | `asp status` | roots, rules, and what the journal holds |
 | `asp events`, `asp jobs` | the most recent of each; `--help` lists the filters |
 | `asp retry JOB` | requeue a failed or parked job |
 | `asp rules` | the loaded rules |
 
 Each takes `--config PATH`, and otherwise reads `$ASP_CONFIG` or `./asp.json`.
+
+**Before pointing asp at a tree that matters, run `asp run --dry-run`.** A first
+pass treats every file as new, so every rule runs on everything it matches, and
+an output replaces whatever is already at its path.
+
+`--watch` uses [watchdog](https://github.com/gorakhargosh/watchdog) (inotify on
+Linux), from the `monitor` extra. The monitor only wakes the reconciler: after a
+change it waits for `--settle` seconds of quiet (default 1), then runs an
+ordinary pass, which finds what changed by scanning. Add `--interval N` for a
+pass every N seconds as well, to catch anything the monitor missed; `asp watch`
+does that every 300 seconds by default. Each watched directory costs one
+inotify watch, so a very large tree may need `fs.inotify.max_user_watches`
+raised.
 
 The dashboard shows events per hour, every event and job, each file's history
 and what was derived from it, the loaded rules, and a retry button on jobs that
@@ -240,7 +254,9 @@ paths differ between a host and a container over the same volumes.
   rebuildable index over the filesystem. Deleting the database loses only history
   and queued work.
 - **Reconciliation is authoritative.** A periodic scan is the source of truth;
-  inotify only reduces latency, because it drops events.
+  inotify only reduces latency, because it drops events. So the monitor carries
+  no information into the journal: it says "look now", and the scan says what
+  changed. Every event's source is therefore `scan` or `handler:<rule>`.
 - **Config is JSON only** (`asp.json`). No TOML anywhere, except `pyproject.toml`,
   which Python packaging requires.
 - **Metrics come from a Prometheus exporter** at `/metrics`, scraped rather than
@@ -263,8 +279,8 @@ paths differ between a host and a container over the same volumes.
 ## M1: the observatory
 
 Daemon (monitor, journal, reconciler), CLI, localhost web UI, `/metrics`, and
-Grafana dashboards, with **zero real handlers**. Still to come: the inotify
-monitor, settle windows, and the Grafana dashboards. It is useful on its own, because
+Grafana dashboards, with **zero real handlers**. Still to come: the Grafana
+dashboards. It is useful on its own, because
 it shows what actually changes in synced trees. Done when a sync storm can be
 watched live in Grafana and paged through in the UI.
 
@@ -284,8 +300,12 @@ a single `run_once()` reconciliation pass, `out/` must hold exactly the uppercas
 `.txt` files (so `*.md` produced nothing and no temp file leaked), and `in/` must
 be unchanged. A pass is synchronous, so the negative case needs no idle signal.
 
-`tests/test_journal.py` covers reconciliation against a journal, and
-`tests/test_web.py` the dashboard and CLI.
+`tests/test_journal.py` covers reconciliation against a journal,
+`tests/test_web.py` the dashboard and CLI, and `tests/test_dry_run.py` the dry
+run. `tests/test_monitor.py` is the first test's scenario against the live
+loop. It needs no sleep to assert that `*.md` produced nothing: every pass scans
+the whole tree, so once the last matching file is published and the loop
+reports idle (`Reconciler.wait_idle()`), the non-matching file has been seen.
 
 Tests written ahead of the code are marked `xfail`; `xfail_strict` makes an
 unexpected pass fail the run, so each marker comes off as soon as the code lands.
@@ -313,11 +333,9 @@ unexpected pass fail the run, so each marker comes off as soon as the code lands
 
 - Symlink semantics: the link index, projecting events onto aliases, and
   containment
-- An observable idle state, so a test against the live daemon can assert that
-  nothing happened without sleeping
 - Where the journal lives in a container (likely a third volume); on a host it is
   wherever `db` says
-- Journal retention, per-rule settle windows
+- Journal retention, per-rule settle windows (there is one global `--settle`)
 - What a rule on `deleted` receives, and whether outputs whose input is gone
   should be reported as orphans. Today the event is journaled and nothing is removed.
 - Changes are detected by size and mtime; the `sha256` column is not filled in yet.
