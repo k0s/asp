@@ -3,17 +3,22 @@
 import importlib
 import os
 import tempfile
+import threading
+import time
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 from .config import Config, ConfigError, load_config
-from .patterns import PatternError, matches, render_output, split_root
+from .journal import RUNNABLE, Journal, now
+from .patterns import PatternError, matches, output_glob, render_output, split_root
 from .rules import Event, Rule, rules_of
 
 TEMP_PREFIX = ".asp-"
 TEMP_SUFFIX = ".tmp"
+MAX_ATTEMPTS = 3    # a job that raises this many times is parked
+MAX_DEPTH = 8       # a file this many handlers from an authored one runs nothing
 
 
 class ContractError(RuntimeError):
@@ -28,11 +33,39 @@ class BoundRule:
     match: str
     output_root: str | None  # None: the output lands in the input's root
     output: str | None       # None: a side-effect rule, with no output
+    # (root, glob) of what this rule's handler publishes, under any of its
+    # rules. A rule never runs on those: a thumbnail of a thumbnail is a loop.
+    own_outputs: tuple[tuple[str | None, str], ...] = ()
+
+    def is_own_output(self, root: str, rel: PurePosixPath) -> bool:
+        return any(out_root in (None, root) and matches(glob, rel)
+                   for out_root, glob in self.own_outputs)
+
+    def overwrites(self, event: Event) -> bool:
+        """Whether this rule's output for the event is the event's own file."""
+        return (self.output is not None
+                and self.output_root in (None, event.root)
+                and render_output(self.output, event.rel) == event.rel)
 
     def applies_to(self, event: Event) -> bool:
+        # A rule that would overwrite its input still applies, so that running
+        # it fails loudly instead of the rule silently never matching.
         return (event.kind in self.rule.on
                 and self.match_root in (None, event.root)
-                and matches(self.match, event.rel))
+                and matches(self.match, event.rel)
+                and (self.overwrites(event)
+                     or not self.is_own_output(event.root, event.rel)))
+
+
+@dataclass
+class Pass:
+    """What one reconciliation pass did."""
+    files: int = 0
+    events: int = 0
+    jobs: dict[str, int] = field(default_factory=dict)   # by final state
+
+    def count(self, state: str) -> None:
+        self.jobs[state] = self.jobs.get(state, 0) + 1
 
 
 def is_temp(name: str) -> bool:
@@ -69,7 +102,14 @@ def load_rules(config: Config) -> list[BoundRule]:
                     raise ConfigError(f"duplicate rule name {rule.name!r}")
                 seen[rule.name] = rule
                 bound.append(bind(rule, config.roots))
-    return bound
+    outputs: dict[int, list[tuple[str | None, str]]] = {}
+    for b in bound:
+        if b.output is not None:
+            outputs.setdefault(id(b.rule.handler), []).append(
+                (b.output_root, output_glob(b.output)))
+    return [BoundRule(b.rule, b.match_root, b.match, b.output_root, b.output,
+                      tuple(outputs.get(id(b.rule.handler), ())))
+            for b in bound]
 
 
 def current_umask() -> int:
@@ -82,7 +122,10 @@ class Engine:
     def __init__(self, config: Config, rules: list[BoundRule]) -> None:
         self.config = config
         self.rules = rules
+        self.by_name = {b.rule.name: b for b in rules}
         self.file_mode = 0o666 & ~current_umask()
+        self.journal = Journal(config.db) if config.db else None
+        self.lock = threading.Lock()    # one pass at a time
 
     @classmethod
     def from_config(cls, path: str | os.PathLike[str],
@@ -90,44 +133,190 @@ class Engine:
         config = load_config(path, environ)
         return cls(config, load_rules(config))
 
-    def scan(self) -> Iterator[Event]:
-        """Every regular file under every root, as a "created" event. With no
-        journal yet, nothing has been seen before. Symlinks and asp's own temp
-        files are skipped."""
-        ts = datetime.now(UTC)
-        n = 0
+    def ignored(self, rel: PurePosixPath) -> bool:
+        return any(matches(glob, rel) for glob in self.config.ignore)
+
+    def walk(self) -> Iterator[tuple[str, PurePosixPath, Path, os.stat_result]]:
+        """Every regular file under every root, in a stable order. Symlinks,
+        ignored paths, asp's own temp files and the journal are skipped."""
+        own = self.journal.files if self.journal else frozenset()
         for root_name, root in self.config.roots.items():
             for dirpath, dirnames, filenames in os.walk(root):
-                dirnames.sort()
+                here = PurePosixPath(Path(dirpath).relative_to(root).as_posix())
+                dirnames[:] = sorted(d for d in dirnames if not self.ignored(here / d))
                 for filename in sorted(filenames):
-                    path = Path(dirpath, filename)
-                    if is_temp(filename) or not path.is_file(follow_symlinks=False):
+                    path, rel = Path(dirpath, filename), here / filename
+                    if (is_temp(filename) or self.ignored(rel) or path in own
+                            or not path.is_file(follow_symlinks=False)):
                         continue
-                    st = path.stat()
-                    n += 1
-                    yield Event(id=n, ts=ts, kind="created", root=root_name,
-                                rel=PurePosixPath(path.relative_to(root).as_posix()),
-                                path=path, source="scan",
-                                size=st.st_size, mtime=st.st_mtime)
+                    try:
+                        st = path.stat()
+                    except FileNotFoundError:   # gone since it was listed
+                        continue
+                    yield root_name, rel, path, st
 
-    def run_once(self) -> None:
-        """One reconciliation pass: run each applicable rule on each file.
-        The file list is taken before any handler runs, so a pass never sees
-        its own outputs."""
-        for event in list(self.scan()):
-            for bound in self.rules:
-                if bound.applies_to(event):
-                    self.run_job(bound, event)
+    def scan(self) -> Iterator[Event]:
+        """Every file as a "created" event: what a pass sees with no journal,
+        where nothing has been seen before."""
+        ts = datetime.now(UTC)
+        for n, (root, rel, path, st) in enumerate(self.walk(), 1):
+            yield Event(id=n, ts=ts, kind="created", root=root, rel=rel, path=path,
+                        source="scan", size=st.st_size, mtime=st.st_mtime)
 
-    def run_job(self, bound: BoundRule, event: Event) -> None:
+    def run_once(self) -> Pass:
+        """One reconciliation pass. The file list is taken before any handler
+        runs, so a pass never sees its own outputs.
+
+        Without a journal every file is new, every applicable rule runs, and a
+        handler that raises aborts the pass. With one, only what changed since
+        the last pass raises events, and a failing job is recorded and retried
+        on later passes rather than stopping this one."""
+        with self.lock:
+            if self.journal is not None:
+                return self.reconcile(self.journal)
+            done = Pass()
+            for event in list(self.scan()):
+                done.files += 1
+                done.events += 1
+                for bound in self.rules:
+                    if bound.applies_to(event):
+                        published = self.run_job(bound, event)
+                        done.count("done" if published or bound.output is None
+                                   else "skipped")
+            return done
+
+    def reconcile(self, journal: Journal) -> Pass:
+        done = Pass()
+        ts = now()
+        found = {(root, rel.as_posix()): st for root, rel, _, st in self.walk()}
+        done.files = len(found)
+        with journal.connect() as db:
+            pass_id = db.execute("insert into passes(started) values (?)", (ts,)).lastrowid
+            known = {(r["root"], r["rel"]): r for r in db.execute("select * from catalog")}
+            changes: list[tuple[str, str, str]] = []    # kind, root, rel
+            for key, st in found.items():
+                was = known.get(key)
+                if was is None:
+                    changes.append(("created", *key))
+                elif (was["size"], was["mtime"]) != (st.st_size, st.st_mtime):
+                    changes.append(("modified", *key))
+            # A root missing from this config is out of scope, not deleted.
+            changes += [("deleted", *key) for key in known
+                        if key not in found and key[0] in self.config.roots]
+
+            for kind, root, rel in changes:
+                st = found.get((root, rel))
+                # A file some job published is derived: one step deeper than
+                # the input it was made from.
+                maker = db.execute(
+                    "select j.rule, e.depth from jobs j join events e on e.id = j.event_id "
+                    "where j.output_root = ? and j.output_rel = ? and j.state = 'done' "
+                    "order by j.id desc limit 1", (root, rel)).fetchone()
+                depth = maker["depth"] + 1 if maker else 0
+                source = f"handler:{maker['rule']}" if maker else "scan"
+                size, mtime = (st.st_size, st.st_mtime) if st else (None, None)
+                event_id = db.execute(
+                    "insert into events(ts, pass_id, source, kind, root, rel, depth, size, mtime)"
+                    " values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (ts, pass_id, source, kind, root, rel, depth, size, mtime)).lastrowid
+                if kind == "deleted":
+                    db.execute("delete from catalog where root = ? and rel = ?", (root, rel))
+                else:
+                    db.execute(
+                        "insert into catalog(root, rel, size, mtime, first_seen, last_seen,"
+                        " depth, derived_by) values (?, ?, ?, ?, ?, ?, ?, ?) "
+                        "on conflict(root, rel) do update set size = excluded.size, "
+                        "mtime = excluded.mtime, last_seen = excluded.last_seen, "
+                        "depth = excluded.depth, derived_by = excluded.derived_by",
+                        (root, rel, size, mtime, ts, ts, depth, maker["rule"] if maker else None))
+                event = self.event(event_id, ts, kind, root, rel, source, depth, size, mtime)
+                for bound in self.rules:
+                    if bound.applies_to(event):
+                        over = depth >= MAX_DEPTH
+                        db.execute(
+                            "insert into jobs(ts, rule, event_id, state, error) "
+                            "values (?, ?, ?, ?, ?)",
+                            (ts, bound.rule.name, event_id, "parked" if over else "queued",
+                             f"depth cap: {depth} handlers from an authored file"
+                             if over else None))
+                        if over:
+                            done.count("parked")
+            done.events = len(changes)
+            runnable = db.execute(
+                "select j.id, j.rule, j.attempts, e.id as event_id, e.ts, e.kind, e.root,"
+                " e.rel, e.source, e.depth, e.size, e.mtime from jobs j "
+                "join events e on e.id = j.event_id "
+                f"where j.state in ({', '.join('?' * len(RUNNABLE))}) order by j.id",
+                RUNNABLE).fetchall()
+
+        # Each job commits on its own, so a crash loses at most the one running.
+        for job in runnable:
+            state, output, error = self.attempt(job)
+            if state == "failed" and job["attempts"] + 1 >= MAX_ATTEMPTS:
+                state = "parked"
+            done.count(state)
+            with journal.connect() as db:
+                db.execute(
+                    "update jobs set state = ?, attempts = attempts + 1, output_root = ?,"
+                    " output_rel = ?, finished = ?, duration = ?, error = ? where id = ?",
+                    (state, *output, now(), error[1], error[0], job["id"]))
+        with journal.connect() as db:
+            db.execute("update passes set finished = ?, files = ?, events = ?, jobs = ? "
+                       "where id = ?", (now(), done.files, done.events, len(runnable), pass_id))
+        return done
+
+    def event(self, event_id: int, ts: str, kind: str, root: str, rel: str,
+              source: str, depth: int, size: int | None, mtime: float | None) -> Event:
+        return Event(id=event_id, ts=datetime.fromisoformat(ts), kind=kind, root=root,
+                     rel=PurePosixPath(rel), path=self.config.roots[root] / rel,
+                     source=source, depth=depth, size=size, mtime=mtime)
+
+    def attempt(self, job: Mapping) -> tuple[str, tuple[str | None, str | None],
+                                              tuple[str | None, float]]:
+        """Run one journaled job: (state, (output root, rel), (error, seconds))."""
+        started = time.monotonic()
+        state, output, error = "done", (None, None), None
+        bound = self.by_name.get(job["rule"])
+        try:
+            if bound is None:
+                raise LookupError(f"no rule named {job['rule']!r} is loaded")
+            if job["root"] not in self.config.roots:
+                raise LookupError(f"no root named {job['root']!r} is configured")
+            event = self.event(job["event_id"], job["ts"], job["kind"], job["root"],
+                               job["rel"], job["source"], job["depth"], job["size"],
+                               job["mtime"])
+            if event.kind != "deleted" and not event.path.is_file():
+                state, error = "skipped", "the input is gone"
+            else:
+                published = self.run_job(bound, event)
+                if published is not None:
+                    output = published
+                elif bound.output is not None:
+                    state = "skipped"
+        except Exception as exc:
+            state, error = "failed", self.portable(f"{type(exc).__name__}: {exc}")
+        return state, output, (error, time.monotonic() - started)
+
+    def portable(self, text: str) -> str:
+        """Text with absolute root paths rewritten as `root:`, since nothing
+        the journal keeps may depend on where this host mounts things."""
+        for name, path in sorted(self.config.roots.items(),
+                                 key=lambda item: -len(str(item[1]))):
+            text = text.replace(f"{path}{os.sep}", f"{name}:").replace(str(path), f"{name}:")
+        return text
+
+    def run_job(self, bound: BoundRule, event: Event) -> tuple[str, str] | None:
+        """Run a rule's handler on an event. Returns the (root, rel) it
+        published, or None when it published nothing."""
         rule = bound.rule
         if bound.output is None:
             if rule.handler(event, None, **rule.params) is not None:
                 raise ContractError(f"rule {rule.name!r} has no output but returned one")
-            return
+            return None
 
-        root = self.config.roots[bound.output_root or event.root]
-        dest = root / render_output(bound.output, event.rel)
+        out_root = bound.output_root or event.root
+        out_rel = render_output(bound.output, event.rel)
+        dest = self.config.roots[out_root] / out_rel
         if dest == event.path:
             raise ContractError(f"rule {rule.name!r} would overwrite its input {event.rel}")
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -146,6 +335,7 @@ class Engine:
         out.close()
         if result is None:
             temp.unlink()
-            return
+            return None
         temp.chmod(self.file_mode)
         os.replace(temp, dest)
+        return out_root, out_rel.as_posix()

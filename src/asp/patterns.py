@@ -48,3 +48,9 @@ def render_output(template: str, rel: PurePosixPath) -> PurePosixPath:
     if not parts or parts[0] == "/" or ".." in parts:
         raise PatternError(f"{template!r} renders outside its root: {rendered!r}")
     return PurePosixPath(*parts)
+
+
+def output_glob(template: str) -> str:
+    """The glob matching everything an output template can render: the
+    template read backwards. '{dir}/thumbs/{name}' -> '**/thumbs/*'."""
+    return template.replace("{dir}", "**").replace("{name}", "*")

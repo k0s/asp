@@ -9,7 +9,13 @@ from pathlib import Path
 from .patterns import ROOT_NAME
 
 ROOT_ENV = "ASP_ROOT"
-KEYS = frozenset({"roots", "watchers"})
+KEYS = frozenset({"roots", "watchers", "db", "ignore"})
+
+# Sync and version-control debris, matched against root-relative paths of both
+# directories (which are then not entered) and files. `.stversions` matters
+# most: Syncthing fills it with copies of changed files, which rules would act on.
+DEFAULT_IGNORE = ("**/.stfolder", "**/.stversions", "**/.git", "**/.hg",
+                  "**/.syncthing.*.tmp", "**/~syncthing~*.tmp")
 
 
 class ConfigError(ValueError):
@@ -21,6 +27,8 @@ class Config:
     path: Path
     roots: dict[str, Path]
     watchers: tuple[str, ...]
+    db: Path | None = None                    # the journal; None runs without one
+    ignore: tuple[str, ...] = DEFAULT_IGNORE
 
 
 def resolve_root(value: str, base: Path) -> Path:
@@ -61,4 +69,11 @@ def load_config(path: str | os.PathLike[str],
         if not root.is_dir():
             raise ConfigError(f"{path}: root {name!r} is not a directory: {root}")
         resolved[name] = root
-    return Config(path=path, roots=resolved, watchers=tuple(watchers))
+    db, ignore = data.get("db"), data.get("ignore", list(DEFAULT_IGNORE))
+    if not (db is None or isinstance(db, str) and db):
+        raise ConfigError(f"{path}: 'db' must be a path")
+    if not (isinstance(ignore, list) and all(isinstance(g, str) for g in ignore)):
+        raise ConfigError(f"{path}: 'ignore' must be a list of globs")
+    return Config(path=path, roots=resolved, watchers=tuple(watchers),
+                  db=None if db is None else resolve_root(db, base),
+                  ignore=tuple(ignore))
