@@ -3,8 +3,8 @@
 **asp** (asset pipeline) is a filesystem data pipeline. It watches directories,
 records every change in a durable journal, and runs rules that react to it.
 
-Status: **pre-code.** This README records the agreed design, and the first test
-(expected to fail until the engine exists) pins down the entry point.
+Status: **first engine.** `Engine.from_config(path).run_once()` runs one
+reconciliation pass. There is no journal, daemon, or monitor yet.
 
 asp is meant to run equally well **as a container**: an input volume, an output
 volume, and a config. The in-process test runs the same arrangement, with temp
