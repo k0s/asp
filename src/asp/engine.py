@@ -68,6 +68,26 @@ class Pass:
         self.jobs[state] = self.jobs.get(state, 0) + 1
 
 
+@dataclass(frozen=True)
+class Planned:
+    """A job a pass would run."""
+    rule: str
+    kind: str                       # the event's kind
+    root: str
+    rel: str
+    output: tuple[str, str] | None  # (root, rel) it would publish, if any
+    overwrites: bool                # that output is already on disk
+    why: str                        # "new", or the state of a job waiting to rerun
+
+
+@dataclass
+class Plan:
+    """What a pass would do: the result of a dry run."""
+    files: int = 0
+    events: dict[str, int] = field(default_factory=dict)    # by kind
+    jobs: list[Planned] = field(default_factory=list)
+
+
 def is_temp(name: str) -> bool:
     return name.startswith(TEMP_PREFIX) and name.endswith(TEMP_SUFFIX)
 
@@ -119,19 +139,24 @@ def current_umask() -> int:
 
 
 class Engine:
-    def __init__(self, config: Config, rules: list[BoundRule]) -> None:
+    def __init__(self, config: Config, rules: list[BoundRule],
+                 create_journal: bool = True) -> None:
         self.config = config
         self.rules = rules
         self.by_name = {b.rule.name: b for b in rules}
         self.file_mode = 0o666 & ~current_umask()
-        self.journal = Journal(config.db) if config.db else None
+        # With create_journal=False a journal that doesn't exist yet is left
+        # that way, and the engine plans as if it had no history.
+        self.journal = (Journal(config.db)
+                        if config.db and (create_journal or config.db.exists()) else None)
         self.lock = threading.Lock()    # one pass at a time
 
     @classmethod
     def from_config(cls, path: str | os.PathLike[str],
-                    environ: Mapping[str, str] | None = None) -> "Engine":
+                    environ: Mapping[str, str] | None = None,
+                    create_journal: bool = True) -> "Engine":
         config = load_config(path, environ)
-        return cls(config, load_rules(config))
+        return cls(config, load_rules(config), create_journal)
 
     def ignored(self, rel: PurePosixPath) -> bool:
         return any(matches(glob, rel) for glob in self.config.ignore)
@@ -193,25 +218,10 @@ class Engine:
         with journal.connect() as db:
             pass_id = db.execute("insert into passes(started) values (?)", (ts,)).lastrowid
             known = {(r["root"], r["rel"]): r for r in db.execute("select * from catalog")}
-            changes: list[tuple[str, str, str]] = []    # kind, root, rel
-            for key, st in found.items():
-                was = known.get(key)
-                if was is None:
-                    changes.append(("created", *key))
-                elif (was["size"], was["mtime"]) != (st.st_size, st.st_mtime):
-                    changes.append(("modified", *key))
-            # A root missing from this config is out of scope, not deleted.
-            changes += [("deleted", *key) for key in known
-                        if key not in found and key[0] in self.config.roots]
-
+            changes = self.diff(found, known)
             for kind, root, rel in changes:
                 st = found.get((root, rel))
-                # A file some job published is derived: one step deeper than
-                # the input it was made from.
-                maker = db.execute(
-                    "select j.rule, e.depth from jobs j join events e on e.id = j.event_id "
-                    "where j.output_root = ? and j.output_rel = ? and j.state = 'done' "
-                    "order by j.id desc limit 1", (root, rel)).fetchone()
+                maker = self.maker(db, root, rel)
                 depth = maker["depth"] + 1 if maker else 0
                 source = f"handler:{maker['rule']}" if maker else "scan"
                 size, mtime = (st.st_size, st.st_mtime) if st else (None, None)
@@ -264,6 +274,85 @@ class Engine:
             db.execute("update passes set finished = ?, files = ?, events = ?, jobs = ? "
                        "where id = ?", (now(), done.files, done.events, len(runnable), pass_id))
         return done
+
+    def diff(self, found: Mapping, known: Mapping) -> list[tuple[str, str, str]]:
+        """(kind, root, rel) for each file whose size or mtime differs from
+        the catalog's, or that only one of them has."""
+        changes = []
+        for key, st in found.items():
+            was = known.get(key)
+            if was is None:
+                changes.append(("created", *key))
+            elif (was["size"], was["mtime"]) != (st.st_size, st.st_mtime):
+                changes.append(("modified", *key))
+        # A root missing from this config is out of scope, not deleted.
+        changes += [("deleted", *key) for key in known
+                    if key not in found and key[0] in self.config.roots]
+        return changes
+
+    @staticmethod
+    def maker(db, root: str, rel: str):
+        """The job that published a file, if one did. Such a file is derived:
+        one step deeper than the input it was made from."""
+        return db.execute(
+            "select j.rule, e.depth from jobs j join events e on e.id = j.event_id "
+            "where j.output_root = ? and j.output_rel = ? and j.state = 'done' "
+            "order by j.id desc limit 1", (root, rel)).fetchone()
+
+    def plan(self) -> "Plan":
+        """What the next pass would do, without doing it: nothing is written
+        to the roots or the journal, and no handler runs."""
+        with self.lock:
+            found = {(root, rel.as_posix()): st for root, rel, _, st in self.walk()}
+            plan = Plan(files=len(found))
+            ts = now()
+            if self.journal is None:
+                known, pending = {}, []
+                changes = self.diff(found, known)
+                depths = {}
+            else:
+                with self.journal.connect() as db:
+                    known = {(r["root"], r["rel"]): r
+                             for r in db.execute("select * from catalog")}
+                    changes = self.diff(found, known)
+                    depths = {}
+                    for _, root, rel in changes:
+                        maker = self.maker(db, root, rel)
+                        if maker:
+                            depths[root, rel] = maker["depth"] + 1
+                    pending = db.execute(
+                        "select j.rule, j.state, e.kind, e.root, e.rel from jobs j "
+                        "join events e on e.id = j.event_id "
+                        f"where j.state in ({', '.join('?' * len(RUNNABLE))}) order by j.id",
+                        RUNNABLE).fetchall()
+            for job in pending:
+                bound = self.by_name.get(job["rule"])
+                if bound is not None and job["root"] in self.config.roots:
+                    plan.jobs.append(self.planned(bound, job["kind"], job["root"],
+                                                  PurePosixPath(job["rel"]), job["state"]))
+            for kind, root, rel in changes:
+                plan.events[kind] = plan.events.get(kind, 0) + 1
+                st = found.get((root, rel))
+                depth = depths.get((root, rel), 0)
+                event = self.event(0, ts, kind, root, rel, "scan", depth,
+                                   st.st_size if st else None, st.st_mtime if st else None)
+                for bound in self.rules:
+                    if bound.applies_to(event):
+                        plan.jobs.append(self.planned(
+                            bound, kind, root, event.rel,
+                            "over the depth cap" if depth >= MAX_DEPTH else "new"))
+            return plan
+
+    def planned(self, bound: BoundRule, kind: str, root: str, rel: PurePosixPath,
+                why: str) -> "Planned":
+        output, exists = None, False
+        if bound.output is not None:
+            out_root = bound.output_root or root
+            out_rel = render_output(bound.output, rel)
+            output = (out_root, out_rel.as_posix())
+            exists = (self.config.roots[out_root] / out_rel).exists()
+        return Planned(rule=bound.rule.name, kind=kind, root=root, rel=rel.as_posix(),
+                       output=output, overwrites=exists, why=why)
 
     def event(self, event_id: int, ts: str, kind: str, root: str, rel: str,
               source: str, depth: int, size: int | None, mtime: float | None) -> Event:
