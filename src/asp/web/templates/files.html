@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}Files · asp{% endblock %}
+{% block main %}
+<h1>Files</h1>
+<form class="filters">
+  <select name="root" onchange="this.form.submit()"><option value="">any root</option>{% for r in config.roots %}<option {% if r == root %}selected{% endif %}>{{ r }}</option>{% endfor %}</select>
+  <select name="derived" onchange="this.form.submit()"><option value="">authored and derived</option><option value="no" {% if derived == "no" %}selected{% endif %}>authored only</option><option value="yes" {% if derived == "yes" %}selected{% endif %}>derived only</option></select>
+  <input type="search" name="q" value="{{ q }}" placeholder="path contains…">
+  <button>Filter</button>
+</form>
+<div class="card">
+{% if files %}
+<table><thead><tr><th></th><th>Path</th><th class="num">Size</th><th>Made by</th><th>First seen</th><th>Last changed</th></tr></thead><tbody>
+{% for f in files %}
+<tr><td style="width:60px">{% if f.rel is image and (f.size or 0) < 524288 %}<img class="thumb" loading="lazy" alt="" onerror="this.remove()" src="/raw?{{ query(root=f.root, rel=f.rel) }}">{% endif %}</td>
+<td>{{ m.path(f.root, f.rel) }}</td><td class="num dim">{{ f.size|bytes }}</td>
+<td>{% if f.derived_by %}<span class="pill">{{ f.derived_by }}</span>{% endif %}</td>
+<td class="when">{{ f.first_seen|when }}</td><td class="when">{{ f.last_seen|when }}</td></tr>
+{% endfor %}
+</tbody></table>
+{% if files|length == 500 %}<div class="more">Showing the 500 most recently changed. Narrow the filter to see others.</div>{% endif %}
+{% else %}<div class="empty">No files match.</div>{% endif %}
+</div>
+{% endblock %}
