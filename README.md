@@ -211,8 +211,11 @@ def rule(*, name: str, on: set[EventKind], match: str,
          params: dict[str, Any] | None = None) -> Callable[[Handler], Handler]: ...
 ```
 
-**`out`** is a temporary file the engine opened in the destination's directory, or
-`None` when the rule declares no output. The engine owns the write: it names temp
+**`out`** is a temporary file the engine opened on the destination's filesystem,
+or `None` when the rule declares no output. It sits in the destination's directory
+if that exists, otherwise in the nearest one above it that does. The destination's
+directory is created only when the handler publishes, so a handler that declines
+leaves nothing behind. The engine owns the write: it names temp
 files so it can ignore their events, keeps them on the destination's filesystem so
 publishing is one atomic rename, and publishes only to the declared path. It
 publishes by path, not through the handle, so a tool that replaces the file at

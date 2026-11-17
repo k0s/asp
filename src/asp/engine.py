@@ -408,8 +408,16 @@ class Engine:
         dest = self.config.roots[out_root] / out_rel
         if dest == event.path:
             raise ContractError(f"rule {rule.name!r} would overwrite its input {event.rel}")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        out = tempfile.NamedTemporaryFile(dir=dest.parent, prefix=TEMP_PREFIX,
+        # The temp file goes in the nearest directory that already exists on
+        # the way to the destination: the same filesystem (a directory that
+        # doesn't exist yet can't be a mount point), so publishing is still one
+        # atomic rename. The destination's own directory is made only when
+        # there is something to publish, so a handler that declines leaves
+        # nothing behind.
+        staging = dest.parent
+        while not staging.is_dir():
+            staging = staging.parent
+        out = tempfile.NamedTemporaryFile(dir=staging, prefix=TEMP_PREFIX,
                                           suffix=TEMP_SUFFIX, delete=False)
         temp = Path(out.name)
         try:
@@ -417,14 +425,15 @@ class Engine:
             if result is not None and result is not out:
                 raise ContractError(f"rule {rule.name!r} returned {result!r}, "
                                     "not its out file or None")
+            out.close()
+            if result is None:
+                temp.unlink()
+                return None
+            temp.chmod(self.file_mode)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(temp, dest)
         except BaseException:
             out.close()
             temp.unlink(missing_ok=True)
             raise
-        out.close()
-        if result is None:
-            temp.unlink()
-            return None
-        temp.chmod(self.file_mode)
-        os.replace(temp, dest)
         return out_root, out_rel.as_posix()
