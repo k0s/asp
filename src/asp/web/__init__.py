@@ -1,8 +1,6 @@
 """The dashboard: a read-mostly web UI over the journal, for localhost."""
 
-import logging
 import math
-import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -15,8 +13,8 @@ from fastapi.templating import Jinja2Templates
 
 from ..engine import Engine
 from ..journal import JOB_STATES
+from ..monitor import Reconciler
 
-log = logging.getLogger("asp")
 TEMPLATES = Path(__file__).parent / "templates"
 KINDS = ("created", "modified", "deleted")
 PAGE = 100
@@ -117,32 +115,23 @@ def metrics_text(engine: Engine) -> str:
     return "\n".join(lines) + "\n"
 
 
-def create_app(engine: Engine, interval: float | None = None) -> FastAPI:
-    """The dashboard for an engine that has a journal. With `interval`, a
-    background thread also runs a reconciliation pass that often."""
+def create_app(engine: Engine, interval: float | None = None,
+               watch: bool = False, settle: float = 1.0) -> FastAPI:
+    """The dashboard for an engine that has a journal. With `interval` or
+    `watch`, a background thread also keeps the roots reconciled."""
     journal = engine.journal
     if journal is None:
         raise ValueError("the dashboard needs a journal: set \"db\" in asp.json")
-    state: dict[str, Any] = {"error": None, "interval": interval}
-    stop = threading.Event()
-
-    def reconcile_forever() -> None:
-        while not stop.is_set():
-            try:
-                engine.run_once()
-                state["error"] = None
-            except Exception as exc:    # keep reconciling; show it on the page
-                log.exception("pass failed")
-                state["error"] = f"{type(exc).__name__}: {exc}"
-            stop.wait(interval)
+    reconciler = (Reconciler(engine, interval=interval, watch=watch, settle=settle)
+                  if interval or watch else None)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if interval:
-            threading.Thread(target=reconcile_forever, name="asp-reconcile",
-                             daemon=True).start()
+        if reconciler:
+            reconciler.start()
         yield
-        stop.set()
+        if reconciler:
+            reconciler.stop()
 
     app = FastAPI(title="asp", lifespan=lifespan, docs_url=None, redoc_url=None)
     templates = Jinja2Templates(directory=TEMPLATES)
@@ -156,7 +145,9 @@ def create_app(engine: Engine, interval: float | None = None) -> FastAPI:
     def page(request: Request, name: str, **context: Any):
         summary = journal.summary()
         return templates.TemplateResponse(request, name, {
-            "summary": summary, "state": state, "config": engine.config,
+            "summary": summary, "config": engine.config,
+            "error": reconciler.error if reconciler else None,
+            "schedule": reconciler.describe() if reconciler else "on demand",
             "attention": summary["jobs"].get("failed", 0) + summary["jobs"].get("parked", 0),
             **context})
 

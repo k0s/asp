@@ -133,7 +133,7 @@ details summary { cursor: pointer; color: var(--text-3); font-size: 12.5px; }
   <form method="post" action="/run"><button class="primary">Run a pass</button></form>
 </div></header>
 <main>
-{% if state.error %}<div class="banner"><strong>The last pass failed.</strong> <span class="error">{{ state.error }}</span></div>{% endif %}
+{% if error %}<div class="banner"><strong>The last pass failed.</strong> <span class="error">{{ error }}</span></div>{% endif %}
 {% block main %}{% endblock %}
 </main>
 <div id="tip"></div>

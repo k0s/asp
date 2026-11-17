@@ -18,7 +18,7 @@
   <div class="tile"><h2>Last pass</h2>
     {% set last = (summary.last_pass.finished|when).split(" ") if summary.last_pass else ["", "never"] %}
     <div class="value">{{ last[1] }}</div>
-    <div class="note">{{ last[0] }} · {% if state.interval %}every {{ state.interval|round|int }} s{% else %}on demand{% endif %}</div></div>
+    <div class="note">{{ last[0] }} · {{ schedule }}</div></div>
 </div>
 
 <div class="card">
