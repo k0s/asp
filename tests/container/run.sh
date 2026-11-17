@@ -3,6 +3,7 @@
 # as the calling user, and check what it writes. Run from the repository root.
 # Needs docker; CI runs it.
 set -euo pipefail
+trap 'echo "FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 image=asp-container-test
 work=$(mktemp -d)
